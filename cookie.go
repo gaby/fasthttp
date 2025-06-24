@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 var zeroTime time.Time
@@ -364,6 +368,40 @@ func (c *Cookie) WriteTo(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 
+// Valid reports whether the cookie complies with RFC specifications.
+func (c *Cookie) Valid() bool {
+	if c == nil {
+		return false
+	}
+	if !isCookieNameValid(b2s(c.key)) {
+		return false
+	}
+	if !c.expire.IsZero() && !validCookieExpires(c.expire) {
+		return false
+	}
+	for i := 0; i < len(c.value); i++ {
+		if !validCookieValueByte(c.value[i]) {
+			return false
+		}
+	}
+	if len(c.path) > 0 {
+		for i := 0; i < len(c.path); i++ {
+			if !validCookiePathByte(c.path[i]) {
+				return false
+			}
+		}
+	}
+	if len(c.domain) > 0 {
+		if !validCookieDomain(b2s(c.domain)) {
+			return false
+		}
+	}
+	if c.partitioned && !c.secure {
+		return false
+	}
+	return true
+}
+
 var errNoCookies = errors.New("no cookies found")
 
 // Parse parses Set-Cookie header.
@@ -590,4 +628,89 @@ func caseInsensitiveCompare(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+func isNotToken(r rune) bool {
+	// isNotToken reports whether r is outside the allowed HTTP token range.
+	return !httpguts.IsTokenRune(r)
+}
+
+func isCookieNameValid(raw string) bool {
+	// isCookieNameValid reports whether raw is a syntactically valid cookie name.
+	if raw == "" {
+		return false
+	}
+	return strings.IndexFunc(raw, isNotToken) < 0
+}
+
+func validCookieValueByte(b byte) bool {
+	// validCookieValueByte reports whether b may appear inside a cookie value.
+	return 0x20 <= b && b < 0x7f && b != '"' && b != ';' && b != '\\'
+}
+
+func validCookiePathByte(b byte) bool {
+	// validCookiePathByte reports whether b may appear in a cookie path.
+	return 0x20 <= b && b < 0x7f && b != ';'
+}
+
+func validCookieExpires(t time.Time) bool {
+	// validCookieExpires reports whether t is a valid expiry time per RFC 6265.
+	return t.Year() >= 1601
+}
+
+func validCookieDomain(v string) bool {
+	// validCookieDomain reports whether v is a syntactically valid cookie domain.
+	if isCookieDomainName(v) {
+		return true
+	}
+	if net.ParseIP(v) != nil && !strings.Contains(v, ":") {
+		return true
+	}
+	return false
+}
+
+func isCookieDomainName(s string) bool {
+	// isCookieDomainName reports whether s is a valid domain-name as defined for cookies.
+	if len(s) == 0 {
+		return false
+	}
+	if len(s) > 255 {
+		return false
+	}
+	if s[0] == '.' {
+		s = s[1:]
+	}
+	last := byte('.')
+	ok := false
+	partlen := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		default:
+			return false
+		case 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z':
+			ok = true
+			partlen++
+		case '0' <= c && c <= '9':
+			partlen++
+		case c == '-':
+			if last == '.' {
+				return false
+			}
+			partlen++
+		case c == '.':
+			if last == '.' || last == '-' {
+				return false
+			}
+			if partlen > 63 || partlen == 0 {
+				return false
+			}
+			partlen = 0
+		}
+		last = c
+	}
+	if last == '-' || partlen > 63 {
+		return false
+	}
+	return ok
 }

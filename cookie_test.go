@@ -448,3 +448,33 @@ func testAppendRequestCookieBytes(t *testing.T, s, expectedS string) {
 		t.Fatalf("Unexpected result %q. Expecting %q for cookie %q", result, expectedS, s)
 	}
 }
+
+func TestCookieValid(t *testing.T) {
+	tests := []struct {
+		cookie *Cookie
+		valid  bool
+	}{
+		{nil, false},
+		{&Cookie{}, false},
+		{&Cookie{key: []byte("invalid-value"), value: []byte("foo\"bar")}, false},
+		{&Cookie{key: []byte("invalid-path"), path: []byte("/foo;bar/")}, false},
+		{&Cookie{key: []byte("invalid-secure-for-partitioned"), value: []byte("foo"), path: []byte("/"), partitioned: true}, false},
+		{&Cookie{key: []byte("invalid-domain"), domain: []byte("example.com:80")}, false},
+		{&Cookie{key: []byte("invalid-expiry"), expire: time.Date(1600, 1, 1, 1, 1, 1, 1, time.UTC)}, false},
+		{&Cookie{key: []byte("valid-empty")}, true},
+		{&Cookie{key: []byte("valid-expires"), value: []byte("foo"), path: []byte("/bar"), domain: []byte("example.com"), expire: time.Unix(0, 0)}, true},
+		{&Cookie{key: []byte("valid-max-age"), value: []byte("foo"), path: []byte("/bar"), domain: []byte("example.com"), maxAge: 60}, true},
+		{&Cookie{key: []byte("valid-all-fields"), value: []byte("foo"), path: []byte("/bar"), domain: []byte("example.com"), expire: time.Unix(0, 0), maxAge: 0}, true},
+		{&Cookie{key: []byte("valid-partitioned"), value: []byte("foo"), path: []byte("/"), secure: true, partitioned: true}, true},
+	}
+
+	for _, tt := range tests {
+		valid := false
+		if tt.cookie != nil {
+			valid = tt.cookie.Valid()
+		}
+		if valid != tt.valid {
+			t.Errorf("%#v.Valid() = %v, want %v", tt.cookie, valid, tt.valid)
+		}
+	}
+}

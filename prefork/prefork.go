@@ -47,12 +47,15 @@ type Prefork struct {
 	Logger Logger
 
 	ln net.Listener
+	pc net.PacketConn
 
 	ServeFunc         func(ln net.Listener) error
 	ServeTLSFunc      func(ln net.Listener, certFile, keyFile string) error
 	ServeTLSEmbedFunc func(ln net.Listener, certData, keyData []byte) error
+	ServePacketFunc   func(pc net.PacketConn) error
 
-	// The network must be "tcp", "tcp4" or "tcp6".
+	// The network must be "tcp", "tcp4" or "tcp6" for TCP,
+	// or "udp", "udp4" or "udp6" for UDP.
 	//
 	// By default is "tcp4"
 	Network string
@@ -108,6 +111,20 @@ func (p *Prefork) listen(addr string) (net.Listener, error) {
 	return net.FileListener(os.NewFile(3, ""))
 }
 
+func (p *Prefork) listenPacket(addr string) (net.PacketConn, error) {
+	runtime.GOMAXPROCS(1)
+
+	if p.Network == "" {
+		p.Network = "udp4"
+	}
+
+	if p.Reuseport {
+		return reuseport.ListenPacket(p.Network, addr)
+	}
+
+	return net.FilePacketConn(os.NewFile(3, ""))
+}
+
 func (p *Prefork) setTCPListenerFiles(addr string) error {
 	if p.Network == "" {
 		p.Network = defaultNetwork
@@ -126,6 +143,33 @@ func (p *Prefork) setTCPListenerFiles(addr string) error {
 	p.ln = tcplistener
 
 	fl, err := tcplistener.File()
+	if err != nil {
+		return err
+	}
+
+	p.files = []*os.File{fl}
+
+	return nil
+}
+
+func (p *Prefork) setUDPPacketConnFiles(addr string) error {
+	if p.Network == "" {
+		p.Network = "udp4"
+	}
+
+	udpAddr, err := net.ResolveUDPAddr(p.Network, addr)
+	if err != nil {
+		return err
+	}
+
+	udpconn, err := net.ListenUDP(p.Network, udpAddr)
+	if err != nil {
+		return err
+	}
+
+	p.pc = udpconn
+
+	fl, err := udpconn.File()
 	if err != nil {
 		return err
 	}
@@ -159,6 +203,82 @@ func (p *Prefork) prefork(addr string) (err error) {
 		// defer for closing the net.Listener opened by setTCPListenerFiles.
 		defer func() {
 			e := p.ln.Close()
+			if err == nil {
+				err = e
+			}
+		}()
+	}
+
+	type procSig struct {
+		err error
+		pid int
+	}
+
+	goMaxProcs := runtime.GOMAXPROCS(0)
+	sigCh := make(chan procSig, goMaxProcs)
+	childProcs := make(map[int]*exec.Cmd)
+
+	defer func() {
+		for _, proc := range childProcs {
+			_ = proc.Process.Kill()
+		}
+	}()
+
+	for i := 0; i < goMaxProcs; i++ {
+		var cmd *exec.Cmd
+		if cmd, err = p.doCommand(); err != nil {
+			p.logger().Printf("failed to start a child prefork process, error: %v\n", err)
+			return err
+		}
+
+		childProcs[cmd.Process.Pid] = cmd
+		go func() {
+			sigCh <- procSig{pid: cmd.Process.Pid, err: cmd.Wait()}
+		}()
+	}
+
+	var exitedProcs int
+	for sig := range sigCh {
+		delete(childProcs, sig.pid)
+
+		p.logger().Printf("one of the child prefork processes exited with "+
+			"error: %v", sig.err)
+
+		exitedProcs++
+		if exitedProcs > p.RecoverThreshold {
+			p.logger().Printf("child prefork processes exit too many times, "+
+				"which exceeds the value of RecoverThreshold(%d), "+
+				"exiting the master process.\n", exitedProcs)
+			err = ErrOverRecovery
+			break
+		}
+
+		var cmd *exec.Cmd
+		if cmd, err = p.doCommand(); err != nil {
+			break
+		}
+		childProcs[cmd.Process.Pid] = cmd
+		go func() {
+			sigCh <- procSig{pid: cmd.Process.Pid, err: cmd.Wait()}
+		}()
+	}
+
+	return err
+}
+
+func (p *Prefork) preforkPacket(addr string) (err error) {
+	if !p.Reuseport {
+		if runtime.GOOS == "windows" {
+			return ErrOnlyReuseportOnWindows
+		}
+
+		if err = p.setUDPPacketConnFiles(addr); err != nil {
+			return err
+		}
+
+		// defer for closing the net.PacketConn opened by setUDPPacketConnFiles.
+		defer func() {
+			e := p.pc.Close()
 			if err == nil {
 				err = e
 			}
@@ -272,4 +392,20 @@ func (p *Prefork) ListenAndServeTLSEmbed(addr string, certData, keyData []byte) 
 	}
 
 	return p.prefork(addr)
+}
+
+// ListenAndServePacket serves UDP requests from the given UDP addr.
+func (p *Prefork) ListenAndServePacket(addr string) error {
+	if IsChild() {
+		pc, err := p.listenPacket(addr)
+		if err != nil {
+			return err
+		}
+
+		p.pc = pc
+
+		return p.ServePacketFunc(pc)
+	}
+
+	return p.preforkPacket(addr)
 }

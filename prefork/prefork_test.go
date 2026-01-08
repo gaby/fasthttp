@@ -224,3 +224,104 @@ func Test_ListenAndServeTLSEmbed(t *testing.T) {
 		t.Error("Prefork.ln is nil")
 	}
 }
+
+func Test_listenPacket(t *testing.T) {
+	t.Parallel()
+
+	p := &Prefork{
+		Reuseport: true,
+		Network:   "udp4",
+	}
+	addr := getAddr()
+
+	pc, err := p.listenPacket(addr)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	pc.Close()
+
+	pcAddr := pc.LocalAddr().String()
+	if pcAddr != addr {
+		t.Errorf("Prefork.Addr == %q, want %q", pcAddr, addr)
+	}
+
+	if p.Network != "udp4" {
+		t.Errorf("Prefork.Network == %q, want %q", p.Network, "udp4")
+	}
+
+	procs := runtime.GOMAXPROCS(0)
+	if procs != 1 {
+		t.Errorf("GOMAXPROCS == %d, want %d", procs, 1)
+	}
+}
+
+func Test_setUDPPacketConnFiles(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.SkipNow()
+	}
+
+	p := &Prefork{
+		Network: "udp4",
+	}
+	addr := getAddr()
+
+	err := p.setUDPPacketConnFiles(addr)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if p.pc == nil {
+		t.Fatal("Prefork.pc is nil")
+	}
+
+	p.pc.Close()
+
+	pcAddr := p.pc.LocalAddr().String()
+	if pcAddr != addr {
+		t.Errorf("Prefork.Addr == %q, want %q", pcAddr, addr)
+	}
+
+	if p.Network != "udp4" {
+		t.Errorf("Prefork.Network == %q, want %q", p.Network, "udp4")
+	}
+
+	if len(p.files) != 1 {
+		t.Errorf("Prefork.files == %d, want %d", len(p.files), 1)
+	}
+}
+
+func Test_ListenAndServePacket(t *testing.T) {
+	// This test can't run parallel as it modifies os.Args.
+
+	setUp()
+	defer tearDown()
+
+	p := &Prefork{
+		Network:   "udp4",
+		Reuseport: true,
+	}
+	p.ServePacketFunc = func(pc net.PacketConn) error {
+		return nil
+	}
+
+	addr := getAddr()
+
+	err := p.ListenAndServePacket(addr)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	p.pc.Close()
+
+	pcAddr := p.pc.LocalAddr().String()
+	if pcAddr != addr {
+		t.Errorf("Prefork.Addr == %q, want %q", pcAddr, addr)
+	}
+
+	if p.pc == nil {
+		t.Error("Prefork.pc is nil")
+	}
+}

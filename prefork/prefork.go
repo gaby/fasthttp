@@ -190,25 +190,8 @@ func (p *Prefork) doCommand() (*exec.Cmd, error) {
 	return cmd, err
 }
 
-func (p *Prefork) prefork(addr string) (err error) {
-	if !p.Reuseport {
-		if runtime.GOOS == "windows" {
-			return ErrOnlyReuseportOnWindows
-		}
-
-		if err = p.setTCPListenerFiles(addr); err != nil {
-			return err
-		}
-
-		// defer for closing the net.Listener opened by setTCPListenerFiles.
-		defer func() {
-			e := p.ln.Close()
-			if err == nil {
-				err = e
-			}
-		}()
-	}
-
+// manageChildProcesses handles spawning and monitoring of child prefork processes.
+func (p *Prefork) manageChildProcesses() error {
 	type procSig struct {
 		err error
 		pid int
@@ -225,8 +208,8 @@ func (p *Prefork) prefork(addr string) (err error) {
 	}()
 
 	for range goMaxProcs {
-		var cmd *exec.Cmd
-		if cmd, err = p.doCommand(); err != nil {
+		cmd, err := p.doCommand()
+		if err != nil {
 			p.logger().Printf("failed to start a child prefork process, error: %v\n", err)
 			return err
 		}
@@ -249,13 +232,12 @@ func (p *Prefork) prefork(addr string) (err error) {
 			p.logger().Printf("child prefork processes exit too many times, "+
 				"which exceeds the value of RecoverThreshold(%d), "+
 				"exiting the master process.\n", exitedProcs)
-			err = ErrOverRecovery
-			break
+			return ErrOverRecovery
 		}
 
-		var cmd *exec.Cmd
-		if cmd, err = p.doCommand(); err != nil {
-			break
+		cmd, err := p.doCommand()
+		if err != nil {
+			return err
 		}
 		childProcs[cmd.Process.Pid] = cmd
 		go func() {
@@ -263,7 +245,29 @@ func (p *Prefork) prefork(addr string) (err error) {
 		}()
 	}
 
-	return err
+	return nil
+}
+
+func (p *Prefork) prefork(addr string) (err error) {
+	if !p.Reuseport {
+		if runtime.GOOS == "windows" {
+			return ErrOnlyReuseportOnWindows
+		}
+
+		if err = p.setTCPListenerFiles(addr); err != nil {
+			return err
+		}
+
+		// defer for closing the net.Listener opened by setTCPListenerFiles.
+		defer func() {
+			e := p.ln.Close()
+			if err == nil {
+				err = e
+			}
+		}()
+	}
+
+	return p.manageChildProcesses()
 }
 
 func (p *Prefork) preforkPacket(addr string) (err error) {
@@ -285,61 +289,7 @@ func (p *Prefork) preforkPacket(addr string) (err error) {
 		}()
 	}
 
-	type procSig struct {
-		err error
-		pid int
-	}
-
-	goMaxProcs := runtime.GOMAXPROCS(0)
-	sigCh := make(chan procSig, goMaxProcs)
-	childProcs := make(map[int]*exec.Cmd)
-
-	defer func() {
-		for _, proc := range childProcs {
-			_ = proc.Process.Kill()
-		}
-	}()
-
-	for range goMaxProcs {
-		var cmd *exec.Cmd
-		if cmd, err = p.doCommand(); err != nil {
-			p.logger().Printf("failed to start a child prefork process, error: %v\n", err)
-			return err
-		}
-
-		childProcs[cmd.Process.Pid] = cmd
-		go func() {
-			sigCh <- procSig{pid: cmd.Process.Pid, err: cmd.Wait()}
-		}()
-	}
-
-	var exitedProcs int
-	for sig := range sigCh {
-		delete(childProcs, sig.pid)
-
-		p.logger().Printf("one of the child prefork processes exited with "+
-			"error: %v", sig.err)
-
-		exitedProcs++
-		if exitedProcs > p.RecoverThreshold {
-			p.logger().Printf("child prefork processes exit too many times, "+
-				"which exceeds the value of RecoverThreshold(%d), "+
-				"exiting the master process.\n", exitedProcs)
-			err = ErrOverRecovery
-			break
-		}
-
-		var cmd *exec.Cmd
-		if cmd, err = p.doCommand(); err != nil {
-			break
-		}
-		childProcs[cmd.Process.Pid] = cmd
-		go func() {
-			sigCh <- procSig{pid: cmd.Process.Pid, err: cmd.Wait()}
-		}()
-	}
-
-	return err
+	return p.manageChildProcesses()
 }
 
 // ListenAndServe serves HTTP requests from the given TCP addr.

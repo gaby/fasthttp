@@ -230,8 +230,8 @@ func (p *Prefork) manageChildProcesses() error {
 		exitedProcs++
 		if exitedProcs > p.RecoverThreshold {
 			p.logger().Printf("child prefork processes exit too many times, "+
-				"which exceeds the value of RecoverThreshold(%d), "+
-				"exiting the master process.\n", exitedProcs)
+				"exited: %d, threshold: %d, exiting the master process.\n",
+				exitedProcs, p.RecoverThreshold)
 			return ErrOverRecovery
 		}
 

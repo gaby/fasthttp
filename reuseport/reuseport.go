@@ -1,6 +1,6 @@
 //go:build !windows && !aix && !solaris
 
-// Package reuseport provides TCP net.Listener with SO_REUSEPORT support.
+// Package reuseport provides TCP net.Listener and UDP net.PacketConn with SO_REUSEPORT support.
 //
 // SO_REUSEPORT allows linear scaling server performance on multi-CPU servers.
 // See https://www.nginx.com/blog/socket-sharding-nginx-release-1-9-1/ for more details :)
@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/valyala/fasthttp/tcplisten"
+	"github.com/valyala/fasthttp/udplisten"
 )
 
 // Listen returns TCP listener with SO_REUSEPORT option set.
@@ -36,8 +37,25 @@ func Listen(network, addr string) (net.Listener, error) {
 	return ln, err
 }
 
+// ListenPacket returns UDP PacketConn with SO_REUSEPORT option set.
+//
+// Only udp, udp4, and udp6 networks are supported.
+//
+// ErrNoReusePort error is returned if the system doesn't support SO_REUSEPORT.
+func ListenPacket(network, addr string) (net.PacketConn, error) {
+	pc, err := udpCfg.NewPacketConn(network, addr)
+	if err != nil && strings.Contains(err.Error(), "SO_REUSEPORT") {
+		return nil, &ErrNoReusePort{err: err}
+	}
+	return pc, err
+}
+
 var cfg = &tcplisten.Config{
 	ReusePort:   true,
 	DeferAccept: true,
 	FastOpen:    true,
+}
+
+var udpCfg = &udplisten.Config{
+	ReusePort: true,
 }

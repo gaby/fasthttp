@@ -65,7 +65,7 @@ func Test_New(t *testing.T) {
 }
 
 func Test_listen(t *testing.T) {
-	t.Parallel()
+	// This test can't run parallel as it modifies GOMAXPROCS.
 
 	p := &Prefork{
 		Reuseport: true,
@@ -226,7 +226,7 @@ func Test_ListenAndServeTLSEmbed(t *testing.T) {
 }
 
 func Test_listenPacket(t *testing.T) {
-	t.Parallel()
+	// This test can't run parallel as it modifies GOMAXPROCS.
 
 	p := &Prefork{
 		Reuseport: true,

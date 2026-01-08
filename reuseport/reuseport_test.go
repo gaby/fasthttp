@@ -20,6 +20,21 @@ func TestTCP6(t *testing.T) {
 	}
 }
 
+func TestUDP4(t *testing.T) {
+	t.Parallel()
+
+	testNewPacketConn(t, "udp4", "localhost:10083")
+}
+
+func TestUDP6(t *testing.T) {
+	t.Parallel()
+
+	// Run this test only if udp6 interface exists.
+	if hasLocalIPv6(t) {
+		testNewPacketConn(t, "udp6", "[::1]:10084")
+	}
+}
+
 func hasLocalIPv6(t *testing.T) bool {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -46,4 +61,19 @@ func testNewListener(t *testing.T, network, addr string) {
 
 	_ = ln1.Close()
 	_ = ln2.Close()
+}
+
+func testNewPacketConn(t *testing.T, network, addr string) {
+	pc1, err := ListenPacket(network, addr)
+	if err != nil {
+		t.Fatalf("cannot create packet conn %v", err)
+	}
+
+	pc2, err := ListenPacket(network, addr)
+	if err != nil {
+		t.Fatalf("cannot create packet conn %v", err)
+	}
+
+	_ = pc1.Close()
+	_ = pc2.Close()
 }

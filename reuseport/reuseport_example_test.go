@@ -19,6 +19,25 @@ func ExampleListen() {
 	}
 }
 
+func ExampleListenPacket() {
+	pc, err := reuseport.ListenPacket("udp4", "localhost:12346")
+	if err != nil {
+		log.Fatalf("error in reuseport packet conn: %v", err)
+	}
+	defer pc.Close()
+
+	buf := make([]byte, 1024)
+	n, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		log.Fatalf("error reading from packet conn: %v", err)
+	}
+
+	_, err = pc.WriteTo(buf[:n], addr)
+	if err != nil {
+		log.Fatalf("error writing to packet conn: %v", err)
+	}
+}
+
 func requestHandler(ctx *fasthttp.RequestCtx) {
 	fmt.Fprintf(ctx, "Hello, world!")
 }

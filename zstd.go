@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -20,9 +21,11 @@ const (
 )
 
 var (
-	zstdDecoderPool            sync.Pool
-	realZstdWriterPoolMap      = newCompressWriterPoolMap()
-	stacklessZstdWriterPoolMap = newCompressWriterPoolMap()
+	zstdDecoderPool                      sync.Pool
+	realZstdWriterPoolMap                = newCompressWriterPoolMap()
+	stacklessZstdWriterPoolMap           = newCompressWriterPoolMap()
+	realZstdConcurrentWriterPoolMap      = newCompressWriterPoolMap()
+	stacklessZstdConcurrentWriterPoolMap = newCompressWriterPoolMap()
 )
 
 func acquireZstdReader(r io.Reader) (*zstd.Decoder, error) {
@@ -82,6 +85,68 @@ func releaseRealZstdWriter(zw *zstd.Encoder, level int) {
 	zw.Close()
 	nLevel := normalizeZstdCompressLevel(level)
 	p := realZstdWriterPoolMap[nLevel]
+	p.Put(zw)
+}
+
+// zstdConcurrentBlocksMinSize is the minimum payload size for which
+// enabling zstd concurrent block compression (see acquireRealZstdWriterConcurrent)
+// is worth its extra, upfront memory cost. Smaller payloads are always
+// compressed with a single goroutine.
+const zstdConcurrentBlocksMinSize = 1 << 20 // 1 MiB
+
+// acquireStacklessZstdWriterConcurrent is identical to acquireStacklessZstdWriter,
+// except that the returned writer takes advantage of zstd's concurrent, job-based
+// block compression (see https://github.com/klauspost/compress/pull/1136), splitting
+// large inputs into sections that are compressed in parallel across multiple goroutines.
+//
+// This should only be used for sufficiently large payloads, since enabling
+// concurrent blocks reserves an additional, potentially large buffer
+// (see zstdConcurrentBlocksMinSize) for the lifetime of the writer.
+func acquireStacklessZstdWriterConcurrent(w io.Writer, compressLevel int) stackless.Writer {
+	nLevel := normalizeZstdCompressLevel(compressLevel)
+	p := stacklessZstdConcurrentWriterPoolMap[nLevel]
+	v := p.Get()
+	if v == nil {
+		return stackless.NewWriter(w, func(w io.Writer) stackless.Writer {
+			return acquireRealZstdWriterConcurrent(w, compressLevel)
+		})
+	}
+	sw := v.(stackless.Writer) //nolint:forcetypeassert
+	sw.Reset(w)
+	return sw
+}
+
+func releaseStacklessZstdWriterConcurrent(zf stackless.Writer, level int) {
+	zf.Close()
+	nLevel := normalizeZstdCompressLevel(level)
+	p := stacklessZstdConcurrentWriterPoolMap[nLevel]
+	p.Put(zf)
+}
+
+func acquireRealZstdWriterConcurrent(w io.Writer, level int) *zstd.Encoder {
+	nLevel := normalizeZstdCompressLevel(level)
+	p := realZstdConcurrentWriterPoolMap[nLevel]
+	v := p.Get()
+	if v == nil {
+		zw, err := zstd.NewWriter(w,
+			zstd.WithEncoderLevel(zstd.EncoderLevel(nLevel)),
+			zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)),
+			zstd.WithConcurrentBlocks(true),
+		)
+		if err != nil {
+			panic(err)
+		}
+		return zw
+	}
+	zw := v.(*zstd.Encoder) //nolint:forcetypeassert
+	zw.Reset(w)
+	return zw
+}
+
+func releaseRealZstdWriterConcurrent(zw *zstd.Encoder, level int) {
+	zw.Close()
+	nLevel := normalizeZstdCompressLevel(level)
+	p := realZstdConcurrentWriterPoolMap[nLevel]
 	p.Put(zw)
 }
 

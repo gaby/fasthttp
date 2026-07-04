@@ -100,3 +100,54 @@ func testZstdCompressSingleCase(s string) error {
 	releaseZstdReader(zr)
 	return nil
 }
+
+func TestZstdCompressConcurrentBlocksSerial(t *testing.T) {
+	t.Parallel()
+
+	if err := testZstdCompressConcurrentBlocks(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestZstdCompressConcurrentBlocksConcurrent(t *testing.T) {
+	t.Parallel()
+
+	if err := testConcurrent(10, testZstdCompressConcurrentBlocks); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testZstdCompressConcurrentBlocks() error {
+	for _, s := range compressTestcases {
+		if err := testZstdCompressConcurrentBlocksSingleCase(s); err != nil {
+			return err
+		}
+	}
+	// Also test with a large, highly compressible payload that spans
+	// multiple concurrent-block jobs.
+	large := bytes.Repeat([]byte("fasthttp-zstd-concurrent-blocks-"), 64*1024)
+	return testZstdCompressConcurrentBlocksSingleCase(string(large))
+}
+
+func testZstdCompressConcurrentBlocksSingleCase(s string) error {
+	var buf bytes.Buffer
+	zw := acquireStacklessZstdWriterConcurrent(&buf, CompressZstdDefault)
+	if _, err := zw.Write([]byte(s)); err != nil {
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
+	}
+	releaseStacklessZstdWriterConcurrent(zw, CompressZstdDefault)
+
+	zr, err := acquireZstdReader(&buf)
+	if err != nil {
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
+	}
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
+	}
+	if string(body) != s {
+		return fmt.Errorf("unexpected string after decompression: len=%d. Expecting len=%d", len(body), len(s))
+	}
+	releaseZstdReader(zr)
+	return nil
+}

@@ -1743,12 +1743,21 @@ func (h *fsHandler) compressFileNolock(
 		}
 		releaseStacklessGzipWriter(zw, CompressDefaultCompression)
 	case "zstd":
-		zw := acquireStacklessZstdWriter(zf, CompressZstdDefault)
-		_, err = copyZeroAlloc(zw, f)
-		if errf := zw.Flush(); err == nil {
-			err = errf
+		if fileInfo.Size() >= zstdConcurrentBlocksMinSize {
+			zw := acquireStacklessZstdWriterConcurrent(zf, CompressZstdDefault)
+			_, err = copyZeroAlloc(zw, f)
+			if errf := zw.Flush(); err == nil {
+				err = errf
+			}
+			releaseStacklessZstdWriterConcurrent(zw, CompressZstdDefault)
+		} else {
+			zw := acquireStacklessZstdWriter(zf, CompressZstdDefault)
+			_, err = copyZeroAlloc(zw, f)
+			if errf := zw.Flush(); err == nil {
+				err = errf
+			}
+			releaseStacklessZstdWriter(zw, CompressZstdDefault)
 		}
-		releaseStacklessZstdWriter(zw, CompressZstdDefault)
 	}
 	_ = zf.Close()
 	_ = f.Close()
@@ -1791,12 +1800,21 @@ func (h *fsHandler) newCompressedFSFileCache(f fs.File, fileInfo fs.FileInfo, fi
 		}
 		releaseStacklessGzipWriter(zw, CompressDefaultCompression)
 	case "zstd":
-		zw := acquireStacklessZstdWriter(w, CompressZstdDefault)
-		_, err = copyZeroAlloc(zw, f)
-		if errf := zw.Flush(); err == nil {
-			err = errf
+		if fileInfo.Size() >= zstdConcurrentBlocksMinSize {
+			zw := acquireStacklessZstdWriterConcurrent(w, CompressZstdDefault)
+			_, err = copyZeroAlloc(zw, f)
+			if errf := zw.Flush(); err == nil {
+				err = errf
+			}
+			releaseStacklessZstdWriterConcurrent(zw, CompressZstdDefault)
+		} else {
+			zw := acquireStacklessZstdWriter(w, CompressZstdDefault)
+			_, err = copyZeroAlloc(zw, f)
+			if errf := zw.Flush(); err == nil {
+				err = errf
+			}
+			releaseStacklessZstdWriter(zw, CompressZstdDefault)
 		}
-		releaseStacklessZstdWriter(zw, CompressZstdDefault)
 	}
 	defer func() { _ = f.Close() }()
 

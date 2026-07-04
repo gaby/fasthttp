@@ -1425,3 +1425,48 @@ func TestFileCacheForZstd(t *testing.T) {
 		t.Fatalf("Unexpected response body %q. Expecting %q", ctx.Response.Body(), data)
 	}
 }
+
+// TestFileCacheForZstdConcurrentBlocks verifies that large files, which are
+// compressed using zstd's concurrent block encoding (see zstd.go), are
+// compressed and served correctly.
+func TestFileCacheForZstdConcurrentBlocks(t *testing.T) {
+	f, err := os.CreateTemp(os.TempDir(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+
+	data := bytes.Repeat([]byte("fasthttp-zstd-concurrent-blocks-"), 64*1024) // > zstdConcurrentBlocksMinSize
+	if _, err = f.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	fs := FS{Root: os.TempDir(), Compress: true, CompressZstd: true, CacheDuration: time.Second * 60}
+	h := fs.NewRequestHandler()
+	var ctx RequestCtx
+	var req Request
+	req.Header.Set("Accept-Encoding", "zstd")
+	req.SetRequestURI("http://foobar.com/" + strings.TrimPrefix(f.Name(), os.TempDir()))
+	ctx.Init(&req, nil, nil)
+	h(&ctx)
+	if !bytes.Equal(ctx.Response.Header.ContentEncoding(), []byte("zstd")) {
+		t.Fatalf("Unexpected 'Content-Encoding' %q. Expecting %q", ctx.Response.Header.ContentEncoding(), "zstd")
+	}
+
+	d, err := acquireZstdReader(strings.NewReader(string(ctx.Response.Body())))
+	if err != nil {
+		t.Fatalf("invalid zstd reader")
+	}
+	plainText, err := io.ReadAll(d)
+	d.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(plainText, data) {
+		t.Fatal("Unexpected response body. zstd concurrent blocks compression doesn't work")
+	}
+}

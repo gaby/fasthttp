@@ -143,13 +143,6 @@ func acquireRealZstdWriterConcurrent(w io.Writer, level int) *zstd.Encoder {
 	return zw
 }
 
-func releaseRealZstdWriterConcurrent(zw *zstd.Encoder, level int) {
-	zw.Close()
-	nLevel := normalizeZstdCompressLevel(level)
-	p := realZstdConcurrentWriterPoolMap[nLevel]
-	p.Put(zw)
-}
-
 func AppendZstdBytesLevel(dst, src []byte, level int) []byte {
 	w := &byteSliceWriter{b: dst}
 	WriteZstdLevel(w, src, level) //nolint:errcheck

@@ -18,24 +18,8 @@ type requestStream struct {
 	header          bodyStreamHeader
 	prefetchedBytes *bytes.Reader
 	reader          *bufio.Reader
-	// maxBodySize caps how much of this stream may be buffered into memory by
-	// Request.Body and friends. Reading the stream directly is not capped: that
-	// is the documented way to handle bodies larger than the limit. 0 means no
-	// limit.
-	maxBodySize    int
-	totalBytesRead int
-	chunkLeft      int
-	// chunkedDone records that the terminating chunk was consumed.
-	chunkedDone bool
-}
-
-// atEnd reports whether the whole body has been read. A connection whose
-// request body was left partly unread can no longer be framed.
-func (rs *requestStream) atEnd() bool {
-	if rs.header.ContentLength() == -1 {
-		return rs.chunkedDone
-	}
-	return rs.totalBytesRead >= rs.header.ContentLength()
+	totalBytesRead  int
+	chunkLeft       int
 }
 
 func (rs *requestStream) Read(p []byte) (int, error) {
@@ -54,7 +38,6 @@ func (rs *requestStream) Read(p []byte) (int, error) {
 				if err != nil && err != io.EOF {
 					return 0, err
 				}
-				rs.chunkedDone = true
 				return 0, io.EOF
 			}
 			rs.chunkLeft = chunkSize
@@ -103,33 +86,21 @@ func (rs *requestStream) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func acquireRequestStream(b *bytebufferpool.ByteBuffer, r *bufio.Reader, h bodyStreamHeader, maxBodySize int) *requestStream {
+func acquireRequestStream(b *bytebufferpool.ByteBuffer, r *bufio.Reader, h bodyStreamHeader) *requestStream {
 	rs := requestStreamPool.Get().(*requestStream) //nolint:forcetypeassert
 	rs.prefetchedBytes = bytes.NewReader(b.B)
 	rs.reader = r
 	rs.header = h
-	rs.maxBodySize = maxBodySize
 	return rs
 }
 
 func releaseRequestStream(rs *requestStream) {
 	rs.prefetchedBytes = nil
-	rs.maxBodySize = 0
 	rs.totalBytesRead = 0
 	rs.chunkLeft = 0
-	rs.chunkedDone = false
 	rs.reader = nil
 	rs.header = nil
 	requestStreamPool.Put(rs)
-}
-
-// bodyStreamBufferLimit reports how much of r may be buffered into memory,
-// 0 if unlimited.
-func bodyStreamBufferLimit(r io.Reader) int {
-	if rs, ok := r.(*requestStream); ok {
-		return rs.maxBodySize
-	}
-	return 0
 }
 
 var requestStreamPool = sync.Pool{

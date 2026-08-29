@@ -3583,7 +3583,7 @@ func TestResponseCompressedBodyStreamCloseDoesNotReleaseRequestStreamBeforeReadD
 	}
 
 	var bodyBuf bytebufferpool.ByteBuffer
-	rs := acquireRequestStream(&bodyBuf, bufio.NewReader(reader), fixedRequestStreamHeader{contentLength: 1}, 0)
+	rs := acquireRequestStream(&bodyBuf, bufio.NewReader(reader), fixedRequestStreamHeader{contentLength: 1})
 
 	var resp Response
 	resp.Header.SetContentType("text/plain")

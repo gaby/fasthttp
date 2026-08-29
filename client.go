@@ -2274,43 +2274,6 @@ func dialAddr(
 	return conn, nil
 }
 
-// dialWithinTimeout bounds a DialFunc, which has no timeout parameter of its
-// own, by the request deadline. Without this a blocking custom dialer makes
-// Client.DoTimeout and Request.SetTimeout wait forever. The dial keeps running
-// after the deadline, so a connection that arrives late is closed rather than
-// leaked. timeout <= 0 leaves the dial unbounded, as before.
-func dialWithinTimeout(addr string, dial DialFunc, timeout time.Duration) (net.Conn, error) {
-	if timeout <= 0 {
-		return dial(addr)
-	}
-
-	type dialResult struct {
-		conn net.Conn
-		err  error
-	}
-	ch := make(chan dialResult, 1)
-	go func() {
-		conn, err := dial(addr)
-		ch <- dialResult{conn: conn, err: err}
-	}()
-
-	tc := AcquireTimer(timeout)
-	defer ReleaseTimer(tc)
-
-	select {
-	case res := <-ch:
-		return res.conn, res.err
-	case <-tc.C:
-		go func() {
-			if res := <-ch; res.conn != nil {
-				res.conn.Close()
-			}
-		}()
-		// The deadline is the request timeout, not a dial-specific one.
-		return nil, ErrTimeout
-	}
-}
-
 func callDialFunc(
 	addr string, dial DialFunc, dialWithTimeout DialFuncWithTimeout, dialDualStack, isTLS bool, timeout time.Duration,
 ) (net.Conn, error) {
@@ -2318,7 +2281,7 @@ func callDialFunc(
 		return dialWithTimeout(addr, timeout)
 	}
 	if dial != nil {
-		return dialWithinTimeout(addr, dial, timeout)
+		return dial(addr)
 	}
 	addr = AddMissingPort(addr, isTLS)
 	if timeout > 0 {

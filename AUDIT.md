@@ -3,21 +3,24 @@
 Audit of `github.com/valyala/fasthttp` at commit `0d9439b` (branch
 `claude/codebase-audit-critical-fr5n3v`), Go 1.25.0, linux/amd64.
 
-Every finding below was reproduced against the code in this tree. **All eight
-have since been fixed**, each with a regression test that was checked to fail
-without its fix. The "Suggested fix" notes record what was proposed; the
-"Fixed by" notes record what was actually done where it differs.
+Every finding below was reproduced against the code in this tree. A follow-up
+multi-agent code review of the first fix attempt (see **Follow-up code review**
+at the end) found that two of the eight "fixes" introduced regressions worse
+than the bug and were **withdrawn**; the other six stand, each with a regression
+test that was checked to fail without its fix. The "Suggested fix" notes record
+what was proposed; "Fixed by" / "Withdrawn" record the final outcome.
 
-| # | Severity | Issue | Regression test |
-| --- | --- | --- | --- |
-| 1 | Critical | Race between timed-out handler and connection loop | `TestTimeoutHandlerStreamRequestBodyClosesConn` |
-| 2 | Critical | Body-size limit bypassed when streaming | `TestStreamRequestBodyBufferingRespectsMaxSize`, `TestStreamRequestBodyReadsPastMaxSize` |
-| 3 | High | HEAD + timeout emits a body | `TestTimeoutHandlerHeadSkipsBody` |
-| 4 | High | Per-IP limit blind to IPv6 | `TestPerIPConnCounterIPv6`, `TestGetConnIP` |
-| 5 | High | Timeouts skipped across a custom dialer | `TestDialTimeoutBoundsCustomDial` |
-| 6 | Medium | Unbounded chunk extensions | `TestParseChunkSizeExtensionLimit` |
-| 7 | Medium | Shutdown blocks on a stalled connection | `TestShutdownGracePeriodClosesStalledConn` |
-| 8 | Medium | Content-Length + Transfer-Encoding served | `TestRequestReadLimitBodyContentLengthAndTransferEncoding` |
+| # | Severity | Issue | Outcome | Regression test |
+| --- | --- | --- | --- | --- |
+| 1 | Critical | Race between timed-out handler and connection loop | Fixed | `TestTimeoutHandlerStreamRequestBodyClosesConn` |
+| 2 | Critical | Body-size limit bypassed when streaming | **Withdrawn** | — |
+| 3 | High | HEAD + timeout emits a body | Fixed | `TestTimeoutHandlerHeadSkipsBody` |
+| 4 | High | Per-IP limit blind to IPv6 | Fixed | `TestPerIPConnCounterIPv6`, `TestGetConnIP` |
+| 5 | High | Timeouts skipped across a custom dialer | **Withdrawn** | — |
+| 6 | Medium | Unbounded chunk extensions | Fixed | `TestParseChunkSizeExtensionLimit` |
+| 7 | Medium | Shutdown blocks on a stalled connection | Fixed | `TestShutdownGracePeriodClosesStalledConn` |
+| 8 | Medium | Content-Length + Transfer-Encoding served | Fixed | `TestRequestReadLimitBodyContentLengthAndTransferEncoding` |
+| P1 | Medium | Handler skipped after a denied `Expect: 100-continue` (pre-existing) | Fixed | `TestServerContinueHandlerDenyKeepsServingLaterRequests` |
 
 ## Method
 
@@ -119,14 +122,35 @@ streaming turns the limit into a "call the handler early" threshold, then the
 `MaxRequestBodySize` doc needs to say so and a separate hard ceiling is still
 required.
 
-**Fixed by:** capping only the paths that buffer into memory. `requestStream`
-carries `maxBodySize`, and `Request.bodyBytes` — which backs `PostBody`,
-`Request.Body` and `PostForm` — stops at it with `ErrBodyTooLarge`. Reading
-`RequestBodyStream` directly stays uncapped, which is the documented way to
-handle bodies larger than the limit and what `TestStreamRequestBodyExceedMaxSize`
-already pinned. A body left partly unread now also closes the connection, since
-the remainder would otherwise be parsed as the next request. Both doc comments
-were corrected.
+**Withdrawn.** A per-consumer cap was attempted (`copyBodyStreamWithLimit`
+in `Request.bodyBytes`) and then reverted after the follow-up review, because
+it could not be made correct within the existing API:
+
+- `PostBody`/`Body`/`SwapBody`/`PostForm` return `[]byte` with no error channel,
+  so an over-limit body has nowhere to signal failure. The attempt routed the
+  overflow through the pre-existing `bodyBuf.SetString(err.Error())` path, so
+  `PostBody()` silently returned the literal string
+  `"fasthttp: body size exceeds the given limit"` as the body — data corruption,
+  reproduced, and propagated verbatim to `net/http` handlers via
+  `fasthttpadaptor`.
+- The cap sat in one consumer, so `SwapBody`, `MultipartForm`, and the entire
+  response side (`Response.Body`) still buffered unbounded — the DoS stayed open
+  through other idioms while `maxBodySize` became dead weight on the response path.
+- The accompanying "close the connection if the streamed body was left unread"
+  guard force-closed keep-alive connections for small bodies that were already
+  fully prefetched off the socket (`atEnd()` ignored the prefetch buffer), and
+  skipped hijack dispatch (leaking the ctx) when a handler hijacked without
+  draining the body. Both reproduced against master.
+
+This is not a code bug so much as a design limitation: `StreamRequestBody` calls
+the handler *before* the body is read, and the buffering accessors have no way
+to report "too large". The behaviour reverts to master's — documented as
+"Calling PostBody or Request.Body reads the entire remaining body into memory" —
+and the correct mitigation for untrusted large bodies remains reading
+`RequestBodyStream` directly (which `MaxRequestBodySize` deliberately does not
+cap, per `TestStreamRequestBodyExceedMaxSize`). A real fix needs an API change
+(an error-returning body accessor, or a hard ceiling distinct from the
+call-early threshold) and is out of scope for a bug-fix pass.
 
 ## 3. HIGH — HEAD + `TimeoutHandler` sends a response body
 
@@ -229,11 +253,28 @@ which dial hook is set — e.g. run the dial in a goroutine bounded by the
 remaining request deadline and close the connection if it lands late — or at
 minimum document the gap on `DoTimeout` and `Client.Dial`.
 
-**Fixed by:** `dialWithinTimeout`, which bounds a `Dial` by the request deadline
-and closes a connection that arrives late. It returns `ErrTimeout`, since the
-deadline being enforced is the request timeout. `DialTimeout` (which gets the
-timeout as a parameter) and a zero timeout are both unchanged. Two `TestDialTimeout`
-cases that asserted the old unbounded behaviour were updated.
+**Withdrawn.** The audit misread an intentional, documented contract as a bug.
+The `Client.Dial` / `HostClient.Dial` field docs state plainly: *"if Dial is set
+instead of DialTimeout, Dial will ignore Request timeout. If you want the tcp
+dial process to account for request timeouts, use DialTimeout instead."*
+`DialTimeout` is the supported mechanism for a bounded dial.
+
+A `dialWithinTimeout` wrapper was attempted (bounding `Dial` on a goroutine) and
+reverted, because it broke that contract and added two new failure modes the
+follow-up review caught:
+
+- **Goroutine leak.** For the exact case it targeted — a black-holed dialer that
+  never returns — the dial goroutine and its late-drain goroutine both block
+  forever. A `DialFunc` has no cancellation channel, so this is unfixable: the
+  wrapper converts a single blocked caller (bounded, and avoidable with
+  `DialTimeout`) into an unbounded 2-goroutines-per-request leak.
+- **Panic containment lost.** Running the user's `Dial` on a detached goroutine
+  turns a `recover`-able panic in a custom dialer into a process crash.
+- A dialer that succeeds just after the deadline has its good `net.Conn` closed
+  and the caller still gets `ErrTimeout`.
+
+The behaviour reverts to master's documented contract; callers who want a bounded
+dial should set `DialTimeout`.
 
 ## 6. MEDIUM — Chunk extensions are read without bound and are not counted against `MaxRequestBodySize`
 
@@ -276,10 +317,13 @@ the hazard.
 in-flight connections are closed, or document that `ReadTimeout` is required for
 `Shutdown()` to terminate.
 
-**Fixed by:** both. A new `Server.ShutdownGracePeriod` closes connections still
-in the middle of a request once it elapses; it defaults to zero, so existing
-behaviour is unchanged for anyone who does not set it, and the `Shutdown` doc now
-states the hazard.
+**Fixed by:** both. A new `Server.ShutdownGracePeriod` closes the HTTP/1.x
+connections still in the middle of a request once it elapses; it defaults to
+zero, so existing behaviour is unchanged for anyone who does not set it, and the
+`Shutdown` doc now states the hazard. The grace period does **not** cover
+connections handed to a `NextProto` handler (e.g. HTTP/2) or still inside the TLS
+handshake — those are in `s.open` but not in the idle-connection map — and the
+field doc says so; bound those with `ReadTimeout` instead.
 
 ## 8. MEDIUM — `Content-Length` + `Transfer-Encoding` is accepted rather than rejected
 
@@ -309,18 +353,51 @@ that asserted the old accepting behaviour were updated.
 
 ## Also noted (latent, not reproduced) — fixed
 
+`perIPConn.Close()` / `perIPTLSConn.Close()` returned the wrapper to a
+`sync.Pool` after nulling `c.Conn`. The nil check made an immediate second
+`Close()` a no-op, but if the wrapper was re-acquired by a new connection first,
+a late `Close()` on a stale reference would close an unrelated client's
+connection, decrement the wrong per-IP counter, and double-`Put` the wrapper.
+`Shutdown`'s `closeIdleConns` and the serving goroutine could both close the same
+wrapper; the window was narrow because the listener is already closed during
+shutdown, and no reproduction was constructed.
+
 **Fixed by:** allocating `perIPConn`/`perIPTLSConn` per connection instead of
 pooling them. The wrapper is one small struct per connection, and removing the
 pool removes the resurrection window entirely rather than relying on timing.
 
+## P1. MEDIUM — Handler skipped after a denied `Expect: 100-continue` (pre-existing)
 
+**Where:** `server.go` `serveConnCounted`
 
-`perIPConn.Close()` / `perIPTLSConn.Close()` return the wrapper to a `sync.Pool`
-after nulling `c.Conn`. The nil check makes an immediate second `Close()` a
-no-op, but if the wrapper is re-acquired by a new connection first, a late
-`Close()` on a stale reference would close an unrelated client's connection,
-decrement the wrong per-IP counter, and double-`Put` the wrapper. `Shutdown`'s
-`closeIdleConns` and the serving goroutine can both close the same wrapper; the
-window is narrow because the listener is already closed during shutdown, and I
-could not construct a reproduction. Worth a guard (an explicit `closed` flag, or
-not pooling the wrapper) rather than relying on the timing.
+`continueReadingRequest` was declared once outside the connection loop and never
+reset per iteration. When a `ContinueHandler` denies a request (`417`), that path
+sets the flag `false` but — unlike the `ExpectHandler` deny path — does not close
+the connection. Every later request on that keep-alive connection then fails the
+`if continueReadingRequest { s.Handler(ctx) }` guard, so the handler is silently
+skipped and the client gets an empty `200`.
+
+This is pre-existing (present on master), surfaced by the follow-up review's
+line-by-line scan of the touched function.
+
+**Fixed by:** resetting `continueReadingRequest = true` at the top of each loop
+iteration.
+
+## Follow-up code review
+
+After the first fix pass was pushed, a ten-angle multi-agent code review ran over
+the diff (five correctness angles, three cleanup angles, altitude, conventions).
+It reproduced the two regressions above against master, which is why fixes 2 and
+5 were withdrawn. It also drove the cleanups applied here:
+
+- `closeIdleConns` and the shutdown-grace close were folded into one
+  `closeConns(force bool)` (they were near-duplicate loops).
+- The `maxChunkExtensionLen` comment was corrected: the 4 KB cap is per chunk
+  line (as in `net/http`), not an aggregate bound across the whole body.
+- The `ShutdownGracePeriod` doc was narrowed to the HTTP/1.x connections it
+  actually closes.
+
+Verification after the rework: `go vet` clean, `golangci-lint run` (repo config)
+0 issues, `go test -race` green on the core package, and both withdrawn
+regressions confirmed gone (small-body keep-alive works; `PostBody` returns the
+real body under `StreamRequestBody`).

@@ -4470,8 +4470,7 @@ func TestDialTimeout(t *testing.T) {
 			shouldFailFast: true,
 		},
 		{
-			// A Dial without its own timeout is bounded by the request timeout.
-			name: "client should fail after a millisecond with only Dial set",
+			name: "client should fail after a second due to no dial timeout set",
 			client: &Client{
 				Dial: func(addr string) (net.Conn, error) {
 					time.Sleep(time.Second)
@@ -4479,7 +4478,7 @@ func TestDialTimeout(t *testing.T) {
 				},
 			},
 			requestTimeout: time.Millisecond,
-			shouldFailFast: true,
+			shouldFailFast: false,
 		},
 		{
 			name: "host client should fail after a millisecond due to request timeout",
@@ -4499,7 +4498,7 @@ func TestDialTimeout(t *testing.T) {
 			shouldFailFast: true,
 		},
 		{
-			name: "host client should fail after a millisecond with only Dial set",
+			name: "host client should fail after a second due to no dial timeout set",
 			client: &HostClient{
 				Dial: func(addr string) (net.Conn, error) {
 					time.Sleep(time.Second)
@@ -4507,7 +4506,7 @@ func TestDialTimeout(t *testing.T) {
 				},
 			},
 			requestTimeout: time.Millisecond,
-			shouldFailFast: true,
+			shouldFailFast: false,
 		},
 	}
 
@@ -4846,33 +4845,4 @@ func TestClientRetryIfErrUpstream(t *testing.T) {
 			t.Fatal("RetryIfErrUpstream should be called")
 		}
 	})
-}
-
-func TestDialTimeoutBoundsCustomDial(t *testing.T) {
-	t.Parallel()
-
-	blocked := make(chan struct{})
-	defer close(blocked)
-
-	c := &Client{
-		Dial: func(addr string) (net.Conn, error) {
-			<-blocked
-			return nil, io.EOF
-		},
-	}
-
-	req := AcquireRequest()
-	resp := AcquireResponse()
-	defer ReleaseRequest(req)
-	defer ReleaseResponse(resp)
-	req.SetRequestURI("http://foobar.com/baz")
-
-	start := time.Now()
-	err := c.DoTimeout(req, resp, testTimeout(100*time.Millisecond))
-	if err != ErrTimeout {
-		t.Fatalf("unexpected error: %v. Expecting %v", err, ErrTimeout)
-	}
-	if elapsed := time.Since(start); elapsed > testTimeout(time.Second) {
-		t.Fatalf("DoTimeout waited %v on a blocking Dial", elapsed)
-	}
 }

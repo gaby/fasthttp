@@ -333,11 +333,6 @@ type Server struct {
 	//
 	// The server rejects requests with bodies exceeding this limit.
 	//
-	// With StreamRequestBody the limit instead bounds how much of the body is
-	// buffered in memory: an oversized request reaches the handler, and reading
-	// it through RequestBodyStream is allowed to go past the limit, while
-	// PostBody, Request.Body and PostForm stop at it with ErrBodyTooLarge.
-	//
 	// Request body size is limited by DefaultMaxRequestBodySize by default.
 	// A value less than or equal to zero selects DefaultMaxRequestBodySize; it
 	// does not disable the limit.
@@ -470,11 +465,17 @@ type Server struct {
 	CloseOnShutdown bool
 
 	// ShutdownGracePeriod is how long Shutdown and ShutdownWithContext wait for
-	// in-flight requests before closing the connections still serving them.
+	// in-flight requests before closing the HTTP/1.x connections still serving
+	// them.
 	//
 	// A connection stalled in the middle of a request never returns to idle, so
 	// without this (or a ReadTimeout) a single such client blocks Shutdown for
 	// as long as it holds the connection.
+	//
+	// It applies only to connections the server drives itself. Connections
+	// handed to a NextProto handler (e.g. HTTP/2) or still inside the TLS
+	// handshake are not force-closed here; bound those with ReadTimeout or the
+	// protocol handler's own deadlines.
 	//
 	// A value of zero waits indefinitely, bounded only by the context passed to
 	// ShutdownWithContext.
@@ -485,9 +486,8 @@ type Server struct {
 	// larger than the current limit.
 	//
 	// Process large bodies through RequestBodyStream to keep memory usage
-	// bounded; that reader is not capped by MaxRequestBodySize. PostBody and
-	// Request.Body buffer the remaining body into memory and so stop at
-	// MaxRequestBodySize with ErrBodyTooLarge.
+	// bounded. Calling PostBody or Request.Body reads the entire remaining body
+	// into memory.
 	StreamRequestBody bool
 }
 
@@ -2125,12 +2125,10 @@ func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
 	}
 
 	for {
-		s.closeIdleConns()
-		if !graceDeadline.IsZero() && !time.Now().Before(graceDeadline) {
-			// The grace period is up: connections still in the middle of a
-			// request would otherwise keep this loop spinning forever.
-			s.closeAllConns()
-		}
+		// Once the grace period is up, force-close the connections still in the
+		// middle of a request that would otherwise keep this loop spinning.
+		force := !graceDeadline.IsZero() && !time.Now().Before(graceDeadline)
+		s.closeConns(force)
 
 		if open := s.open.Load(); open == 0 {
 			// There may be a pending request to call ctx.Done(). Therefore, we only set it to nil when open == 0.
@@ -2429,10 +2427,13 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 
 		connectionClose bool
 
-		continueReadingRequest = true
+		continueReadingRequest bool
 	)
 	for {
 		connRequestNum++
+		// Reset per request: a denied Expect on one request must not suppress
+		// the handler for later requests on the same keep-alive connection.
+		continueReadingRequest = true
 
 		if connRequestNum == 1 {
 			// Apply ReadTimeout to the first request byte.
@@ -2694,10 +2695,6 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			// Acquire a new ctx because the old one will still be in use by the timeout out handler.
 			ctx = s.acquireCtx(c)
 			timeoutResponse.CopyTo(&ctx.Response)
-		} else if !ctx.Request.bodyStreamExhausted() {
-			// Whatever the handler left unread would be parsed as the next
-			// request, so the connection can no longer be reused.
-			connectionClose = true
 		}
 
 		if reqIsHead {
@@ -3213,29 +3210,23 @@ func (s *Server) writeErrorResponse(bw *bufio.Writer, ctx *RequestCtx, serverNam
 var idleConnTimePool sync.Pool
 
 func (s *Server) closeIdleConns() {
+	s.closeConns(false)
+}
+
+// closeConns closes tracked connections. When force is false only connections
+// that have gone idle are closed; when true every tracked connection is,
+// including ones still in the middle of a request.
+func (s *Server) closeConns(force bool) {
 	s.idleConnsMu.Lock()
 	now := time.Now().Unix()
 	for c, ict := range s.idleConns {
 		t := ict.Load()
-		if t != 0 && now-t >= 0 {
+		if force || (t != 0 && now-t >= 0) {
 			_ = c.Close()
 			// Don't recycle ict: the connection's own goroutine still holds it
 			// and stores into it, so only that goroutine may return it.
 			delete(s.idleConns, c)
 		}
-	}
-	s.idleConnsMu.Unlock()
-}
-
-// closeAllConns closes every connection the server still tracks, including the
-// ones in the middle of a request.
-func (s *Server) closeAllConns() {
-	s.idleConnsMu.Lock()
-	for c := range s.idleConns {
-		_ = c.Close()
-		// Don't recycle the entry's counter: the connection's own goroutine
-		// still holds it and stores into it.
-		delete(s.idleConns, c)
 	}
 	s.idleConnsMu.Unlock()
 }

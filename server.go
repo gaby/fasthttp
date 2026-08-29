@@ -333,6 +333,11 @@ type Server struct {
 	//
 	// The server rejects requests with bodies exceeding this limit.
 	//
+	// With StreamRequestBody the limit instead bounds how much of the body is
+	// buffered in memory: an oversized request reaches the handler, and reading
+	// it through RequestBodyStream is allowed to go past the limit, while
+	// PostBody, Request.Body and PostForm stop at it with ErrBodyTooLarge.
+	//
 	// Request body size is limited by DefaultMaxRequestBodySize by default.
 	// A value less than or equal to zero selects DefaultMaxRequestBodySize; it
 	// does not disable the limit.
@@ -464,13 +469,25 @@ type Server struct {
 	// CloseOnShutdown when true adds a `Connection: close` header when the server is shutting down.
 	CloseOnShutdown bool
 
+	// ShutdownGracePeriod is how long Shutdown and ShutdownWithContext wait for
+	// in-flight requests before closing the connections still serving them.
+	//
+	// A connection stalled in the middle of a request never returns to idle, so
+	// without this (or a ReadTimeout) a single such client blocks Shutdown for
+	// as long as it holds the connection.
+	//
+	// A value of zero waits indefinitely, bounded only by the context passed to
+	// ShutdownWithContext.
+	ShutdownGracePeriod time.Duration
+
 	// StreamRequestBody enables request body streaming,
 	// and calls the handler sooner when given body is
 	// larger than the current limit.
 	//
 	// Process large bodies through RequestBodyStream to keep memory usage
-	// bounded. Calling PostBody or Request.Body reads the entire remaining body
-	// into memory.
+	// bounded; that reader is not capped by MaxRequestBodySize. PostBody and
+	// Request.Body buffer the remaining body into memory and so stop at
+	// MaxRequestBodySize with ErrBodyTooLarge.
 	StreamRequestBody bool
 }
 
@@ -2051,13 +2068,18 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 // Shutdown gracefully shuts down the server without interrupting any active connections.
-// Shutdown works by first closing all open listeners and then waiting indefinitely for all connections
+// Shutdown works by first closing all open listeners and then waiting for all connections
 // to return to idle and then shut down.
 //
 // When Shutdown is called, Serve, ListenAndServe, and ListenAndServeTLS immediately return nil.
 // Make sure the program doesn't exit and waits instead for Shutdown to return.
 //
 // Shutdown does not close keepalive connections so it's recommended to set ReadTimeout and IdleTimeout to something else than 0.
+//
+// A connection stalled in the middle of a request never returns to idle, so a
+// single such client blocks Shutdown for as long as it holds the connection.
+// Set ShutdownGracePeriod, ReadTimeout, or use ShutdownWithContext to bound the
+// wait.
 func (s *Server) Shutdown() error {
 	return s.ShutdownWithContext(context.Background())
 }
@@ -2097,8 +2119,18 @@ func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
 	ticker := time.NewTicker(time.Millisecond * 100)
 	defer ticker.Stop()
 
+	var graceDeadline time.Time
+	if s.ShutdownGracePeriod > 0 {
+		graceDeadline = time.Now().Add(s.ShutdownGracePeriod)
+	}
+
 	for {
 		s.closeIdleConns()
+		if !graceDeadline.IsZero() && !time.Now().Before(graceDeadline) {
+			// The grace period is up: connections still in the middle of a
+			// request would otherwise keep this loop spinning forever.
+			s.closeAllConns()
+		}
 
 		if open := s.open.Load(); open == 0 {
 			// There may be a pending request to call ctx.Done(). Therefore, we only set it to nil when open == 0.
@@ -2158,7 +2190,7 @@ func acceptConn(s *Server, ln net.Listener, lastPerIPErrorTime *time.Time) (net.
 			if pic == nil {
 				if time.Since(*lastPerIPErrorTime) > time.Minute {
 					s.logger().Printf("The number of connections from %s exceeds MaxConnsPerIP=%d",
-						getConnIP4(c), s.MaxConnsPerIP)
+						getConnIP(c), s.MaxConnsPerIP)
 					*lastPerIPErrorTime = time.Now()
 				}
 				continue
@@ -2170,8 +2202,9 @@ func acceptConn(s *Server, ln net.Listener, lastPerIPErrorTime *time.Time) (net.
 }
 
 func wrapPerIPConn(s *Server, c net.Conn) net.Conn {
-	ip := getUint32IP(c)
-	if ip == 0 {
+	ip := getConnIP(c)
+	if !ip.IsValid() {
+		// Not a TCP connection, so there is no peer address to count against.
 		return c
 	}
 	n := s.perIPConnCounter.Register(ip)
@@ -2636,6 +2669,13 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		ctx.connRequestNum = connRequestNum
 		ctx.time = time.Now()
 
+		// Framing depends on the request as received. It is read before the
+		// handler runs because a timed out handler keeps using ctx from its own
+		// goroutine, so reading it afterwards would race with that handler.
+		reqIsHead := ctx.Request.Header.IsHead()
+		reqIsHTTP11 := ctx.Request.Header.IsHTTP11()
+		reqHasBodyStream := ctx.Request.bodyStream != nil
+
 		// If a client denies a request the handler should not be called
 		if continueReadingRequest {
 			s.Handler(ctx)
@@ -2643,12 +2683,24 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 
 		timeoutResponse = ctx.timeoutResponse
 		if timeoutResponse != nil {
+			if reqHasBodyStream {
+				// The timed out handler still owns the old ctx and may keep
+				// reading its body stream, which reads from br. Drop br without
+				// pooling it and close the connection, so this loop never shares
+				// the reader with that handler.
+				br = nil
+				connectionClose = true
+			}
 			// Acquire a new ctx because the old one will still be in use by the timeout out handler.
 			ctx = s.acquireCtx(c)
 			timeoutResponse.CopyTo(&ctx.Response)
+		} else if !ctx.Request.bodyStreamExhausted() {
+			// Whatever the handler left unread would be parsed as the next
+			// request, so the connection can no longer be reused.
+			connectionClose = true
 		}
 
-		if ctx.IsHead() {
+		if reqIsHead {
 			ctx.Response.SkipBody = true
 		}
 
@@ -2676,7 +2728,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			(s.CloseOnShutdown && s.stop.Load() == 1)
 		if connectionClose {
 			ctx.Response.Header.SetConnectionClose()
-		} else if !ctx.Request.Header.IsHTTP11() {
+		} else if !reqIsHTTP11 {
 			// Set 'Connection: keep-alive' response header for HTTP/1.0 request.
 			// There is no need in setting this header for http/1.1, since in http/1.1
 			// connections are keep-alive by default.
@@ -3171,6 +3223,19 @@ func (s *Server) closeIdleConns() {
 			// and stores into it, so only that goroutine may return it.
 			delete(s.idleConns, c)
 		}
+	}
+	s.idleConnsMu.Unlock()
+}
+
+// closeAllConns closes every connection the server still tracks, including the
+// ones in the middle of a request.
+func (s *Server) closeAllConns() {
+	s.idleConnsMu.Lock()
+	for c := range s.idleConns {
+		_ = c.Close()
+		// Don't recycle the entry's counter: the connection's own goroutine
+		// still holds it and stores into it.
+		delete(s.idleConns, c)
 	}
 	s.idleConnsMu.Unlock()
 }

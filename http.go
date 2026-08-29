@@ -69,6 +69,10 @@ type Request struct {
 	parsedPostArgs bool
 	uriParseErr    error
 
+	// bodyStreamUnread records that a body stream was closed with data still
+	// left in it.
+	bodyStreamUnread bool
+
 	keepBodyBuffer bool
 
 	// Used by Server to indicate the request was received on a HTTPS endpoint.
@@ -471,7 +475,9 @@ func (req *Request) bodyBytes() []byte {
 	if req.bodyStream != nil {
 		bodyBuf := req.bodyBuffer()
 		bodyBuf.Reset()
-		_, err := copyBodyStream(bodyBuf, req.bodyStream)
+		// Buffering the stream into memory stays within MaxRequestBodySize.
+		// Reading req.bodyStream directly is the way to go past it.
+		_, err := copyBodyStreamWithLimit(bodyBuf, req.bodyStream, bodyStreamBufferLimit(req.bodyStream))
 		req.closeBodyStream() //nolint:errcheck
 		if err != nil {
 			bodyBuf.SetString(err.Error())
@@ -1287,6 +1293,7 @@ func (req *Request) Reset() {
 
 func (req *Request) resetSkipHeader() {
 	req.ResetBody()
+	req.bodyStreamUnread = false
 	req.uri.Reset()
 	req.parsedURI = false
 	req.uriParseErr = nil
@@ -1564,12 +1571,12 @@ func (req *Request) ContinueReadBodyStream(r *bufio.Reader, maxBodySize int, pre
 		if err == ErrBodyTooLarge {
 			req.Header.SetContentLength(contentLength)
 			req.body = bodyBuf
-			req.bodyStream = acquireRequestStream(bodyBuf, r, &req.Header)
+			req.bodyStream = acquireRequestStream(bodyBuf, r, &req.Header, maxBodySize)
 			return nil
 		}
 		if err == errChunkedStream {
 			req.body = bodyBuf
-			req.bodyStream = acquireRequestStream(bodyBuf, r, &req.Header)
+			req.bodyStream = acquireRequestStream(bodyBuf, r, &req.Header, maxBodySize)
 			return nil
 		}
 		req.Reset()
@@ -1577,7 +1584,7 @@ func (req *Request) ContinueReadBodyStream(r *bufio.Reader, maxBodySize int, pre
 	}
 
 	req.body = bodyBuf
-	req.bodyStream = acquireRequestStream(bodyBuf, r, &req.Header)
+	req.bodyStream = acquireRequestStream(bodyBuf, r, &req.Header, maxBodySize)
 	req.Header.SetContentLength(contentLength)
 	return nil
 }
@@ -1666,18 +1673,18 @@ func (resp *Response) ReadBody(r *bufio.Reader, maxBodySize int) (err error) {
 	case contentLength >= 0:
 		bodyBuf.B, err = readBody(r, contentLength, maxBodySize, bodyBuf.B)
 		if err == ErrBodyTooLarge && resp.StreamBody {
-			resp.bodyStream = acquireRequestStream(bodyBuf, r, &resp.Header)
+			resp.bodyStream = acquireRequestStream(bodyBuf, r, &resp.Header, maxBodySize)
 			err = nil
 		}
 	case contentLength == -1:
 		if resp.StreamBody {
-			resp.bodyStream = acquireRequestStream(bodyBuf, r, &resp.Header)
+			resp.bodyStream = acquireRequestStream(bodyBuf, r, &resp.Header, maxBodySize)
 		} else {
 			bodyBuf.B, err = readBodyChunked(r, maxBodySize, bodyBuf.B)
 		}
 	default:
 		if resp.StreamBody {
-			resp.bodyStream = acquireRequestStream(bodyBuf, r, &resp.Header)
+			resp.bodyStream = acquireRequestStream(bodyBuf, r, &resp.Header, maxBodySize)
 		} else {
 			bodyBuf.B, err = readBodyIdentity(r, maxBodySize, bodyBuf.B)
 			resp.Header.SetContentLength(len(bodyBuf.B))
@@ -2388,10 +2395,23 @@ func (req *Request) closeBodyStream() error {
 		err = bsc.Close()
 	}
 	if rs, ok := req.bodyStream.(*requestStream); ok {
+		req.bodyStreamUnread = !rs.atEnd()
 		releaseRequestStream(rs)
 	}
 	req.bodyStream = nil
 	return err
+}
+
+// bodyStreamExhausted reports whether the streamed body was read to completion.
+// Anything left unread would be parsed as the start of the next request.
+func (req *Request) bodyStreamExhausted() bool {
+	if req.bodyStreamUnread {
+		return false
+	}
+	if rs, ok := req.bodyStream.(*requestStream); ok {
+		return rs.atEnd()
+	}
+	return true
 }
 
 func (resp *Response) closeBodyStream(wErr error) error {
@@ -2639,6 +2659,20 @@ func writeBodyFixedSize(w *bufio.Writer, r io.Reader, size int64) error {
 		err = fmt.Errorf("copied %d bytes from body stream instead of %d bytes", n, size)
 	}
 	return err
+}
+
+// copyBodyStreamWithLimit copies at most maxBodySize bytes and reports
+// ErrBodyTooLarge beyond that. maxBodySize <= 0 means no limit.
+func copyBodyStreamWithLimit(w io.Writer, r io.Reader, maxBodySize int) (int64, error) {
+	if maxBodySize <= 0 {
+		return copyBodyStream(w, r)
+	}
+	lr := &io.LimitedReader{R: r, N: int64(maxBodySize) + 1}
+	n, err := copyBodyStream(w, lr)
+	if err == nil && lr.N <= 0 {
+		return n, ErrBodyTooLarge
+	}
+	return n, err
 }
 
 func copyBodyStream(w io.Writer, r io.Reader) (int64, error) {
@@ -2949,6 +2983,12 @@ func readBodyChunked(r *bufio.Reader, maxBodySize int, dst []byte) ([]byte, erro
 	}
 }
 
+// maxChunkExtensionLen bounds the bytes that may follow a chunk size before
+// CRLF. They are not part of the body, so they never reach MaxRequestBodySize
+// accounting and would otherwise let a client stream unlimited data into a
+// server configured with a small body limit.
+const maxChunkExtensionLen = 4096
+
 func parseChunkSize(r *bufio.Reader) (int, error) {
 	n, err := readHexInt(r)
 	if err != nil {
@@ -2956,7 +2996,12 @@ func parseChunkSize(r *bufio.Reader) (int, error) {
 	}
 	inExt := false
 	afterSizeOWS := false
-	for {
+	for read := 0; ; read++ {
+		if read > maxChunkExtensionLen {
+			return -1, ErrBrokenChunk{
+				error: errors.New("chunk extension is too long"),
+			}
+		}
 		c, err := r.ReadByte()
 		if err != nil {
 			return -1, ErrBrokenChunk{

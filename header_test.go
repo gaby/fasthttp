@@ -612,14 +612,12 @@ func TestRequestDisableSpecialHeaders(t *testing.T) {
 			string(req.Body()), testBody)
 	}
 
+	// Ambiguous framing stays an error even when special headers are disabled.
 	var ambiguous Request
 	ambiguous.Header.DisableSpecialHeader()
 	br3 := bufio.NewReader(bytes.NewBufferString("POST /test HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n"))
-	if err := ambiguous.ReadLimitBody(br3, 0); err != nil {
-		t.Fatalf("unexpected error reading ambiguous request: %v", err)
-	}
-	if body := string(ambiguous.Body()); body != "test" {
-		t.Fatalf("body content incorrect with ambiguous framing: got %q, expected %q", body, "test")
+	if err := ambiguous.ReadLimitBody(br3, 0); !errors.Is(err, ErrBothContentLengthAndTransferEncoding) {
+		t.Fatalf("expected ErrBothContentLengthAndTransferEncoding, got %v", err)
 	}
 }
 

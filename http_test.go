@@ -1792,28 +1792,11 @@ func TestRequestReadLimitBody(t *testing.T) {
 func TestRequestReadLimitBodyContentLengthAndTransferEncoding(t *testing.T) {
 	t.Parallel()
 
-	tests := []string{
-		"POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT",
-		"POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT",
-	}
-
-	for _, s := range tests {
-		var req Request
-		br := bufio.NewReader(bytes.NewBufferString(s))
-		if err := req.ReadLimitBody(br, 0); err != nil {
-			t.Fatalf("unexpected error: %v. s=%q", err, s)
-		}
-		if body := string(req.Body()); body != "test" {
-			t.Fatalf("unexpected body %q. Expecting %q. s=%q", body, "test", s)
-		}
-		b, err := br.Peek(4)
-		if err != nil {
-			t.Fatalf("unexpected error reading remaining bytes: %v. s=%q", err, s)
-		}
-		if string(b) != "NEXT" {
-			t.Fatalf("unexpected remaining bytes %q. Expecting %q. s=%q", b, "NEXT", s)
-		}
-	}
+	// RFC 9112 section 6.1: a message with both framing headers is an error,
+	// whichever order they arrive in. Serving it lets an intermediary that
+	// resolves the conflict the other way smuggle the trailing request.
+	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT", 0, ErrBothContentLengthAndTransferEncoding)
+	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT", 0, ErrBothContentLengthAndTransferEncoding)
 
 	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 1nope\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 0, ErrNonNumericChars)
 	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 1nope\r\n\r\n0\r\n\r\n", 0, ErrNonNumericChars)
@@ -2309,6 +2292,22 @@ func TestParseChunkSizeWhitespaceError(t *testing.T) {
 				t.Fatalf("expecting error when reading chunk size %q", test)
 			}
 		})
+	}
+}
+
+func TestParseChunkSizeExtensionLimit(t *testing.T) {
+	t.Parallel()
+
+	// Extension bytes aren't body bytes, so they never reach MaxRequestBodySize
+	// accounting. Without a cap a client can stream unlimited data past it.
+	rb := bufio.NewReader(bytes.NewBufferString("1;" + strings.Repeat("a", maxChunkExtensionLen) + "\r\n"))
+	if _, err := parseChunkSize(rb); err == nil {
+		t.Fatal("expecting error for an oversized chunk extension")
+	}
+
+	rb = bufio.NewReader(bytes.NewBufferString("1;" + strings.Repeat("a", 64) + "\r\n"))
+	if n, err := parseChunkSize(rb); err != nil || n != 1 {
+		t.Fatalf("unexpected size=%d err=%v for a short chunk extension", n, err)
 	}
 }
 
@@ -3584,7 +3583,7 @@ func TestResponseCompressedBodyStreamCloseDoesNotReleaseRequestStreamBeforeReadD
 	}
 
 	var bodyBuf bytebufferpool.ByteBuffer
-	rs := acquireRequestStream(&bodyBuf, bufio.NewReader(reader), fixedRequestStreamHeader{contentLength: 1})
+	rs := acquireRequestStream(&bodyBuf, bufio.NewReader(reader), fixedRequestStreamHeader{contentLength: 1}, 0)
 
 	var resp Response
 	resp.Header.SetContentType("text/plain")

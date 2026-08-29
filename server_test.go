@@ -5264,3 +5264,208 @@ func TestRequestCtxInitShouldNotBeCanceledIssue1879(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTimeoutHandlerHeadSkipsBody(t *testing.T) {
+	t.Parallel()
+
+	h := TimeoutHandler(func(ctx *RequestCtx) {
+		time.Sleep(testTimeout(200 * time.Millisecond))
+		ctx.SetBodyString("should not be sent")
+	}, testTimeout(30*time.Millisecond), "timeout")
+
+	ln := fasthttputil.NewInmemoryListener()
+	s := &Server{Handler: h}
+	go s.Serve(ln)     //nolint:errcheck
+	defer s.Shutdown() //nolint:errcheck
+
+	c, err := ln.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err = c.Write([]byte("HEAD / HTTP/1.1\r\nHost: aaa.com\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.SetReadDeadline(time.Now().Add(testTimeout(time.Second))); err != nil {
+		t.Fatal(err)
+	}
+
+	br := bufio.NewReader(c)
+	var resp Response
+	resp.SkipBody = true
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusRequestTimeout {
+		t.Fatalf("unexpected status code %d. Expecting %d", resp.StatusCode(), StatusRequestTimeout)
+	}
+	// SkipBody stops the reader at the headers, so anything the server wrote
+	// after them is still sitting in br.
+	if n := br.Buffered(); n != 0 {
+		extra, _ := br.Peek(n)
+		t.Fatalf("unexpected body sent in response to HEAD: %q", extra)
+	}
+}
+
+func TestTimeoutHandlerStreamRequestBodyClosesConn(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h := TimeoutHandler(func(ctx *RequestCtx) {
+		close(started)
+		<-release
+		// Keep reading after the timeout: the server must no longer be sharing
+		// this reader with its connection loop.
+		io.Copy(io.Discard, ctx.RequestBodyStream()) //nolint:errcheck
+	}, testTimeout(30*time.Millisecond), "timeout")
+
+	ln := fasthttputil.NewInmemoryListener()
+	s := &Server{Handler: h, StreamRequestBody: true, Logger: &testLogger{}}
+	go s.Serve(ln)     //nolint:errcheck
+	defer s.Shutdown() //nolint:errcheck
+
+	c, err := ln.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err = c.Write([]byte("POST / HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(testTimeout(time.Second)):
+		t.Fatal("handler wasn't called")
+	}
+
+	if err = c.SetReadDeadline(time.Now().Add(testTimeout(time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	var resp Response
+	if err = resp.Read(bufio.NewReader(c)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.ConnectionClose() {
+		t.Fatal("expecting 'Connection: close' so the loop stops reading the shared reader")
+	}
+	close(release)
+}
+
+func TestStreamRequestBodyBufferingRespectsMaxSize(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Repeat("a", 5000)
+	requests := map[string]string{
+		"content-length": fmt.Sprintf("POST / HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: %d\r\n\r\n%s", len(body), body),
+		"chunked":        fmt.Sprintf("POST / HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", len(body), body),
+	}
+
+	for name, raw := range requests {
+		t.Run(name, func(t *testing.T) {
+			var gotBody string
+			ln := fasthttputil.NewInmemoryListener()
+			s := &Server{
+				Handler:            func(ctx *RequestCtx) { gotBody = string(ctx.PostBody()) },
+				StreamRequestBody:  true,
+				MaxRequestBodySize: 100,
+			}
+			go s.Serve(ln)     //nolint:errcheck
+			defer s.Shutdown() //nolint:errcheck
+
+			c, err := ln.Dial()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if _, err = c.Write([]byte(raw)); err != nil {
+				t.Fatal(err)
+			}
+			if err = c.SetReadDeadline(time.Now().Add(testTimeout(time.Second))); err != nil {
+				t.Fatal(err)
+			}
+
+			var resp Response
+			if err = resp.Read(bufio.NewReader(c)); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotBody != ErrBodyTooLarge.Error() {
+				t.Fatalf("buffered %d bytes past MaxRequestBodySize, body=%q", len(gotBody), gotBody)
+			}
+			if !resp.ConnectionClose() {
+				t.Fatal("expecting 'Connection: close' after leaving part of the body unread")
+			}
+		})
+	}
+}
+
+func TestStreamRequestBodyReadsPastMaxSize(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Repeat("a", 5000)
+	var got int64
+	ln := fasthttputil.NewInmemoryListener()
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+			got, _ = io.Copy(io.Discard, ctx.RequestBodyStream())
+		},
+		StreamRequestBody:  true,
+		MaxRequestBodySize: 100,
+	}
+	go s.Serve(ln)     //nolint:errcheck
+	defer s.Shutdown() //nolint:errcheck
+
+	c, err := ln.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err = fmt.Fprintf(c, "POST / HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: %d\r\n\r\n%s", len(body), body); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.SetReadDeadline(time.Now().Add(testTimeout(time.Second))); err != nil {
+		t.Fatal(err)
+	}
+
+	var resp Response
+	if err = resp.Read(bufio.NewReader(c)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != int64(len(body)) {
+		t.Fatalf("RequestBodyStream read %d bytes. Expecting %d", got, len(body))
+	}
+}
+
+func TestShutdownGracePeriodClosesStalledConn(t *testing.T) {
+	t.Parallel()
+
+	ln := fasthttputil.NewInmemoryListener()
+	s := &Server{
+		Handler:             func(ctx *RequestCtx) {},
+		ShutdownGracePeriod: testTimeout(200 * time.Millisecond),
+	}
+	go s.Serve(ln) //nolint:errcheck
+
+	c, err := ln.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// Partial request: the connection never returns to idle.
+	if _, err = c.Write([]byte("GET / HTTP/1.1\r\nHost: aaa.com\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.Shutdown() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(testTimeout(3 * time.Second)):
+		t.Fatal("Shutdown didn't return within the grace period")
+	}
+}

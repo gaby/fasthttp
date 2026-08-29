@@ -3,20 +3,19 @@ package fasthttp
 import (
 	"crypto/tls"
 	"net"
+	"net/netip"
 	"sync"
 )
 
 type perIPConnCounter struct {
-	perIPConnPool    sync.Pool
-	perIPTLSConnPool sync.Pool
-	m                map[uint32]int
-	lock             sync.Mutex
+	m    map[netip.Addr]int
+	lock sync.Mutex
 }
 
-func (cc *perIPConnCounter) Register(ip uint32) int {
+func (cc *perIPConnCounter) Register(ip netip.Addr) int {
 	cc.lock.Lock()
 	if cc.m == nil {
-		cc.m = make(map[uint32]int)
+		cc.m = make(map[netip.Addr]int)
 	}
 	n := cc.m[ip] + 1
 	cc.m[ip] = n
@@ -24,7 +23,7 @@ func (cc *perIPConnCounter) Register(ip uint32) int {
 	return n
 }
 
-func (cc *perIPConnCounter) Unregister(ip uint32) {
+func (cc *perIPConnCounter) Unregister(ip netip.Addr) {
 	cc.lock.Lock()
 	defer cc.lock.Unlock()
 	if cc.m == nil {
@@ -39,12 +38,16 @@ func (cc *perIPConnCounter) Unregister(ip uint32) {
 	}
 }
 
+// perIPConn and perIPTLSConn are allocated per connection rather than pooled:
+// a wrapper returned to a pool can be handed to a new connection while a stale
+// reference to it still exists, and a late Close() on that reference would then
+// close an unrelated connection and unregister the wrong IP.
 type perIPConn struct {
 	net.Conn
 
 	perIPConnCounter *perIPConnCounter
 
-	ip   uint32
+	ip   netip.Addr
 	lock sync.Mutex
 }
 
@@ -53,38 +56,24 @@ type perIPTLSConn struct {
 
 	perIPConnCounter *perIPConnCounter
 
-	ip   uint32
+	ip   netip.Addr
 	lock sync.Mutex
 }
 
-func acquirePerIPConn(conn net.Conn, ip uint32, counter *perIPConnCounter) net.Conn {
+func acquirePerIPConn(conn net.Conn, ip netip.Addr, counter *perIPConnCounter) net.Conn {
 	if tlsConn, ok := conn.(*tls.Conn); ok {
-		v := counter.perIPTLSConnPool.Get()
-		if v == nil {
-			return &perIPTLSConn{
-				perIPConnCounter: counter,
-				Conn:             tlsConn,
-				ip:               ip,
-			}
-		}
-		c := v.(*perIPTLSConn) //nolint:forcetypeassert
-		c.Conn = tlsConn
-		c.ip = ip
-		return c
-	}
-
-	v := counter.perIPConnPool.Get()
-	if v == nil {
-		return &perIPConn{
+		return &perIPTLSConn{
 			perIPConnCounter: counter,
-			Conn:             conn,
+			Conn:             tlsConn,
 			ip:               ip,
 		}
 	}
-	c := v.(*perIPConn) //nolint:forcetypeassert
-	c.Conn = conn
-	c.ip = ip
-	return c
+
+	return &perIPConn{
+		perIPConnCounter: counter,
+		Conn:             conn,
+		ip:               ip,
+	}
 }
 
 func (c *perIPConn) Close() error {
@@ -99,7 +88,6 @@ func (c *perIPConn) Close() error {
 
 	err := cc.Close()
 	c.perIPConnCounter.Unregister(c.ip)
-	c.perIPConnCounter.perIPConnPool.Put(c)
 	return err
 }
 
@@ -115,24 +103,20 @@ func (c *perIPTLSConn) Close() error {
 
 	err := cc.Close()
 	c.perIPConnCounter.Unregister(c.ip)
-	c.perIPConnCounter.perIPTLSConnPool.Put(c)
 	return err
 }
 
-func getUint32IP(c net.Conn) uint32 {
-	ip := getConnIP4(c)
-
-	if len(ip) != 4 {
-		return 0
-	}
-	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
-}
-
-func getConnIP4(c net.Conn) net.IP {
-	addr := c.RemoteAddr()
-	ipAddr, ok := addr.(*net.TCPAddr)
+// getConnIP returns the peer's IP address, keyed so that every distinct client
+// gets its own counter. IPv4-mapped IPv6 addresses are unmapped so they share a
+// bucket with the same IPv4 peer. Non-TCP connections share the zero Addr.
+func getConnIP(c net.Conn) netip.Addr {
+	addr, ok := c.RemoteAddr().(*net.TCPAddr)
 	if !ok {
-		return net.IPv4zero
+		return netip.Addr{}
 	}
-	return ipAddr.IP.To4()
+	ip, ok := netip.AddrFromSlice(addr.IP)
+	if !ok {
+		return netip.Addr{}
+	}
+	return ip.Unmap()
 }

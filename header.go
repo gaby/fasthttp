@@ -477,9 +477,16 @@ var (
 	ErrEmptyRequestURI               = errors.New("fasthttp: requesturi cannot be empty")
 	ErrDuplicateContentLength        = errors.New("fasthttp: duplicate content-length header")
 	ErrUnsupportedTransferEncoding   = errors.New("fasthttp: unsupported transfer-encoding")
-	ErrNonNumericChars               = errors.New("fasthttp: non-numeric chars found")
-	ErrNeedMore                      = errors.New("fasthttp: need more data: cannot find trailing lf")
-	ErrSmallReadBuffer               = errors.New("fasthttp: small read buffer. increase readbuffersize")
+
+	// ErrBothContentLengthAndTransferEncoding is returned when a request carries
+	// both framing headers. RFC 9112 section 6.1 says such a message ought to be
+	// handled as an error: it is a request smuggling attempt whenever an
+	// intermediary in front of us resolves the conflict the other way.
+	ErrBothContentLengthAndTransferEncoding = errors.New(
+		"fasthttp: both content-length and transfer-encoding are present")
+	ErrNonNumericChars = errors.New("fasthttp: non-numeric chars found")
+	ErrNeedMore        = errors.New("fasthttp: need more data: cannot find trailing lf")
+	ErrSmallReadBuffer = errors.New("fasthttp: small read buffer. increase readbuffersize")
 )
 
 // AddTrailerBytes add Trailer header value for chunked response
@@ -3306,6 +3313,13 @@ func (h *RequestHeader) parseHeaders(buf []byte, blockEnd int) (int, error) {
 	if s.err != nil {
 		h.connectionClose = true
 		return 0, s.err
+	}
+
+	// Checked once both headers have been seen, so the error doesn't depend on
+	// the order they arrive in.
+	if contentLengthSeen && transferEncodingSeen {
+		h.connectionClose = true
+		return 0, ErrBothContentLengthAndTransferEncoding
 	}
 
 	if h.contentLength < 0 {

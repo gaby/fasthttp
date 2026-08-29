@@ -3,9 +3,21 @@
 Audit of `github.com/valyala/fasthttp` at commit `0d9439b` (branch
 `claude/codebase-audit-critical-fr5n3v`), Go 1.25.0, linux/amd64.
 
-Every finding below was reproduced against the code in this tree. Suggested
-fixes are starting points, not applied patches — several involve API or
-behaviour decisions that belong to the maintainers.
+Every finding below was reproduced against the code in this tree. **All eight
+have since been fixed**, each with a regression test that was checked to fail
+without its fix. The "Suggested fix" notes record what was proposed; the
+"Fixed by" notes record what was actually done where it differs.
+
+| # | Severity | Issue | Regression test |
+| --- | --- | --- | --- |
+| 1 | Critical | Race between timed-out handler and connection loop | `TestTimeoutHandlerStreamRequestBodyClosesConn` |
+| 2 | Critical | Body-size limit bypassed when streaming | `TestStreamRequestBodyBufferingRespectsMaxSize`, `TestStreamRequestBodyReadsPastMaxSize` |
+| 3 | High | HEAD + timeout emits a body | `TestTimeoutHandlerHeadSkipsBody` |
+| 4 | High | Per-IP limit blind to IPv6 | `TestPerIPConnCounterIPv6`, `TestGetConnIP` |
+| 5 | High | Timeouts skipped across a custom dialer | `TestDialTimeoutBoundsCustomDial` |
+| 6 | Medium | Unbounded chunk extensions | `TestParseChunkSizeExtensionLimit` |
+| 7 | Medium | Shutdown blocks on a stalled connection | `TestShutdownGracePeriodClosesStalledConn` |
+| 8 | Medium | Content-Length + Transfer-Encoding served | `TestRequestReadLimitBodyContentLengthAndTransferEncoding` |
 
 ## Method
 
@@ -70,6 +82,12 @@ take ownership of `br`/the request stream before swapping ctx, and force
 reader between the two goroutines cannot be made safe by locking alone, because
 the abandoned handler may block indefinitely.
 
+**Fixed by:** dropping `br` without pooling it and forcing `connectionClose`
+when the timed out ctx holds a body stream. The framing state the loop still
+needs (`IsHead`, `IsHTTP11`, whether a body stream exists) is now read *before*
+the handler runs, since reading it afterwards races with the handler that
+outlived the timeout.
+
 ## 2. CRITICAL — `MaxRequestBodySize` is entirely bypassed under `StreamRequestBody`
 
 **Where:** `http.go` `ContinueReadBodyStream`, `streaming.go` `requestStream`
@@ -100,6 +118,15 @@ has no request-body cap at all.
 streaming turns the limit into a "call the handler early" threshold, then the
 `MaxRequestBodySize` doc needs to say so and a separate hard ceiling is still
 required.
+
+**Fixed by:** capping only the paths that buffer into memory. `requestStream`
+carries `maxBodySize`, and `Request.bodyBytes` — which backs `PostBody`,
+`Request.Body` and `PostForm` — stops at it with `ErrBodyTooLarge`. Reading
+`RequestBodyStream` directly stays uncapped, which is the documented way to
+handle bodies larger than the limit and what `TestStreamRequestBodyExceedMaxSize`
+already pinned. A body left partly unread now also closes the connection, since
+the remainder would otherwise be parsed as the next request. Both doc comments
+were corrected.
 
 ## 3. HIGH — HEAD + `TimeoutHandler` sends a response body
 
@@ -168,6 +195,11 @@ protection — and worse, it is a shared quota: one IPv6 client opening
 over `netip.Addr.As16()`, or `netip.Addr` directly), and consider a configurable
 IPv6 prefix width so a single /64 cannot trivially evade the limit.
 
+**Fixed by:** keying on `netip.Addr` (IPv4-mapped addresses unmapped, so they
+share a bucket with the same IPv4 peer). A configurable IPv6 prefix width was
+*not* added — it is a new API surface rather than part of this defect, so a
+client with a whole /64 can still take one slot per address.
+
 ## 5. HIGH — Request timeouts are not enforced across a custom `Dial`
 
 **Where:** `client.go` `callDialFunc`, `dialAddr`, `dialHostHard`
@@ -197,6 +229,12 @@ which dial hook is set — e.g. run the dial in a goroutine bounded by the
 remaining request deadline and close the connection if it lands late — or at
 minimum document the gap on `DoTimeout` and `Client.Dial`.
 
+**Fixed by:** `dialWithinTimeout`, which bounds a `Dial` by the request deadline
+and closes a connection that arrives late. It returns `ErrTimeout`, since the
+deadline being enforced is the request timeout. `DialTimeout` (which gets the
+timeout as a parameter) and a zero timeout are both unchanged. Two `TestDialTimeout`
+cases that asserted the old unbounded behaviour were updated.
+
 ## 6. MEDIUM — Chunk extensions are read without bound and are not counted against `MaxRequestBodySize`
 
 **Where:** `http.go` `parseChunkSize`
@@ -215,6 +253,8 @@ at 4 KB.
 
 **Suggested fix:** cap the chunk-size line (size + extensions) at a few KB and
 fail with `ErrBrokenChunk` beyond it.
+
+**Fixed by:** a 4 KB `maxChunkExtensionLen`, matching `net/http`.
 
 ## 7. MEDIUM — `Shutdown()` blocks indefinitely on a single stalled connection
 
@@ -236,6 +276,11 @@ the hazard.
 in-flight connections are closed, or document that `ReadTimeout` is required for
 `Shutdown()` to terminate.
 
+**Fixed by:** both. A new `Server.ShutdownGracePeriod` closes connections still
+in the middle of a request once it elapses; it defaults to zero, so existing
+behaviour is unchanged for anyone who does not set it, and the `Shutdown` doc now
+states the hazard.
+
 ## 8. MEDIUM — `Content-Length` + `Transfer-Encoding` is accepted rather than rejected
 
 **Where:** `header.go` `RequestHeader.parseHeaders`
@@ -256,9 +301,19 @@ rejects the combination outright.
 **Suggested fix:** return an error and set `connectionClose` when both framing
 headers are present on a request.
 
+**Fixed by:** a new `ErrBothContentLengthAndTransferEncoding`, checked after the
+header block is parsed so the error does not depend on header order. Two tests
+that asserted the old accepting behaviour were updated.
+
 ---
 
-## Also noted (latent, not reproduced)
+## Also noted (latent, not reproduced) — fixed
+
+**Fixed by:** allocating `perIPConn`/`perIPTLSConn` per connection instead of
+pooling them. The wrapper is one small struct per connection, and removing the
+pool removes the resurrection window entirely rather than relying on timing.
+
+
 
 `perIPConn.Close()` / `perIPTLSConn.Close()` return the wrapper to a `sync.Pool`
 after nulling `c.Conn`. The nil check makes an immediate second `Close()` a

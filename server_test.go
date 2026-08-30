@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net"
+	"net/netip"
 	"os"
 	"reflect"
 	"regexp"
@@ -5412,5 +5413,48 @@ func TestServerContinueHandlerDenyClosesConn(t *testing.T) {
 		if p == "/smuggled" {
 			t.Fatal("handler ran on bytes smuggled after a denied Expect")
 		}
+	}
+}
+
+type fakeTLSConn struct {
+	net.Conn
+}
+
+func (c *fakeTLSConn) Handshake() error { return nil }
+
+func (c *fakeTLSConn) ConnectionState() tls.ConnectionState {
+	return tls.ConnectionState{ServerName: "example.com"}
+}
+
+func TestRequestCtxTLSThroughPerIPConn(t *testing.T) {
+	t.Parallel()
+
+	// A TLS connection that isn't literally *tls.Conn goes into the plain
+	// perIPConn wrapper, which promotes nothing beyond net.Conn. Without an
+	// unwrap the TLS accessors silently report a plaintext connection, which
+	// downgrades mTLS handlers. MaxConnsPerIP only wrapped IPv4 peers before
+	// IPv6 keying, so this is reachable for every peer now.
+	var counter perIPConnCounter
+	ip := netip.MustParseAddr("2001:db8::1")
+	counter.Register(ip)
+	defer counter.Unregister(ip)
+
+	c := acquirePerIPConn(&fakeTLSConn{}, ip, &counter)
+	if _, ok := c.(*perIPConn); !ok {
+		t.Fatalf("expecting the conn to be wrapped in *perIPConn, got %T", c)
+	}
+
+	var ctx RequestCtx
+	ctx.c = c
+
+	if !ctx.IsTLS() {
+		t.Fatal("IsTLS must see through the per-IP wrapper")
+	}
+	state := ctx.TLSConnectionState()
+	if state == nil {
+		t.Fatal("TLSConnectionState must see through the per-IP wrapper")
+	}
+	if state.ServerName != "example.com" {
+		t.Fatalf("unexpected ServerName %q. Expecting %q", state.ServerName, "example.com")
 	}
 }

@@ -851,6 +851,18 @@ type tlsConn interface {
 	ConnectionState() tls.ConnectionState
 }
 
+// unwrapPerIPConn returns the connection perIPConn wraps, so the tlsConn
+// assertions below still see a TLS connection when MaxConnsPerIP is set.
+// perIPConn embeds the net.Conn interface and so promotes nothing beyond it;
+// perIPTLSConn embeds *tls.Conn directly and needs no unwrapping. The field is
+// never reassigned after the wrapper is built, so this read needs no lock.
+func unwrapPerIPConn(c net.Conn) net.Conn {
+	if pic, ok := c.(*perIPConn); ok {
+		return pic.Conn
+	}
+	return c
+}
+
 // IsTLS returns true if the underlying connection is tls.Conn.
 //
 // tls.Conn is an encrypted connection (aka SSL, HTTPS).
@@ -863,14 +875,7 @@ func (ctx *RequestCtx) IsTLS() bool {
 	//
 	//     // other custom fields here
 	// }
-
-	// perIPConn wraps the net.Conn in the Conn field
-	if pic, ok := ctx.c.(*perIPConn); ok {
-		_, ok := pic.Conn.(tlsConn)
-		return ok
-	}
-
-	_, ok := ctx.c.(tlsConn)
+	_, ok := unwrapPerIPConn(ctx.c).(tlsConn)
 	return ok
 }
 
@@ -881,7 +886,7 @@ func (ctx *RequestCtx) IsTLS() bool {
 // The returned state may be used for verifying TLS version, client certificates,
 // etc.
 func (ctx *RequestCtx) TLSConnectionState() *tls.ConnectionState {
-	tc, ok := ctx.c.(tlsConn)
+	tc, ok := unwrapPerIPConn(ctx.c).(tlsConn)
 	if !ok {
 		return nil
 	}
@@ -1741,7 +1746,7 @@ func (s *Server) NextProto(key string, nph ServeHandler) {
 }
 
 func (s *Server) getNextProto(c net.Conn) (string, error) {
-	if tc, ok := c.(tlsConn); ok {
+	if tc, ok := unwrapPerIPConn(c).(tlsConn); ok {
 		if s.ReadTimeout > 0 {
 			if err := c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
 				return "", err

@@ -103,3 +103,47 @@ func TestGetConnIP(t *testing.T) {
 		}
 	}
 }
+
+type closeRecordingConn struct {
+	net.Conn
+
+	closes int
+}
+
+func (c *closeRecordingConn) Close() error {
+	c.closes++
+	return nil
+}
+
+func (c *closeRecordingConn) Write(b []byte) (int, error) { return len(b), nil }
+
+func TestPerIPConnCloseKeepsConnUsable(t *testing.T) {
+	t.Parallel()
+
+	var counter perIPConnCounter
+	ip := netip.MustParseAddr("1.2.3.4")
+	counter.Register(ip)
+
+	inner := &closeRecordingConn{}
+	c := acquirePerIPConn(inner, ip, &counter)
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// A serving goroutine can still be writing through the wrapper when Close
+	// runs; the promoted method must reach the real conn rather than a nil one.
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatalf("unexpected error writing after Close: %v", err)
+	}
+
+	// Close is idempotent and releases the peer's slot exactly once.
+	if err := c.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inner.closes != 1 {
+		t.Fatalf("inner conn closed %d times. Expecting 1", inner.closes)
+	}
+	if n := len(counter.m); n != 0 {
+		t.Fatalf("unexpected counter map size=%d. Expecting 0", n)
+	}
+}

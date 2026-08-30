@@ -5312,6 +5312,8 @@ func TestTimeoutHandlerStreamRequestBodyClosesConn(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
+	// Deferred so a failed assertion below doesn't park the handler goroutine.
+	defer close(release)
 	h := TimeoutHandler(func(ctx *RequestCtx) {
 		close(started)
 		<-release
@@ -5350,49 +5352,18 @@ func TestTimeoutHandlerStreamRequestBodyClosesConn(t *testing.T) {
 	if !resp.ConnectionClose() {
 		t.Fatal("expecting 'Connection: close' so the loop stops reading the shared reader")
 	}
-	close(release)
 }
 
-func TestShutdownGracePeriodClosesStalledConn(t *testing.T) {
+func TestServerContinueHandlerDenyClosesConn(t *testing.T) {
 	t.Parallel()
 
-	ln := fasthttputil.NewInmemoryListener()
-	s := &Server{
-		Handler:             func(ctx *RequestCtx) {},
-		ShutdownGracePeriod: testTimeout(200 * time.Millisecond),
-	}
-	go s.Serve(ln) //nolint:errcheck
-
-	c, err := ln.Dial()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	// Partial request: the connection never returns to idle.
-	if _, err = c.Write([]byte("GET / HTTP/1.1\r\nHost: aaa.com\r\n")); err != nil {
-		t.Fatal(err)
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- s.Shutdown() }()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	case <-time.After(testTimeout(3 * time.Second)):
-		t.Fatal("Shutdown didn't return within the grace period")
-	}
-}
-
-func TestServerContinueHandlerDenyKeepsServingLaterRequests(t *testing.T) {
-	t.Parallel()
-
+	var servedPaths []string
 	ln := fasthttputil.NewInmemoryListener()
 	s := &Server{
 		ContinueHandler: func(h *RequestHeader) bool { return false },
-		Handler:         func(ctx *RequestCtx) { ctx.SetBodyString("HANDLED") },
+		Handler: func(ctx *RequestCtx) {
+			servedPaths = append(servedPaths, string(ctx.Path()))
+		},
 	}
 	go s.Serve(ln)     //nolint:errcheck
 	defer s.Shutdown() //nolint:errcheck
@@ -5404,34 +5375,42 @@ func TestServerContinueHandlerDenyKeepsServingLaterRequests(t *testing.T) {
 	defer c.Close()
 	br := bufio.NewReader(c)
 
-	// Denied Expect: 100-continue. The client waits for 100 and never sends the
-	// body, so the connection stays clean for the next request.
-	if _, err = c.Write([]byte("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")); err != nil {
+	// A denied Expect leaves the promised body unread, so the connection must
+	// be closed: whatever the client sends next would otherwise be parsed as a
+	// new request and dispatched to the handler.
+	smuggled := "GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n"
+	if _, err = fmt.Fprintf(c, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\nExpect: 100-continue\r\n\r\n", len(smuggled)); err != nil {
 		t.Fatal(err)
 	}
 	if err = c.SetReadDeadline(time.Now().Add(testTimeout(time.Second))); err != nil {
 		t.Fatal(err)
 	}
+
 	var denied Response
 	if err = denied.Read(br); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if denied.StatusCode() != StatusExpectationFailed {
-		t.Fatalf("unexpected status %d, expecting %d", denied.StatusCode(), StatusExpectationFailed)
+		t.Fatalf("unexpected status %d. Expecting %d", denied.StatusCode(), StatusExpectationFailed)
+	}
+	if !denied.ConnectionClose() {
+		t.Fatal("expecting 'Connection: close' after a denied Expect: the body was never read")
 	}
 
-	// A normal request on the same connection must still reach the handler.
-	if _, err = c.Write([]byte("GET /b HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
-		t.Fatal(err)
+	// Writing may already fail on the closed connection; if it succeeds, the
+	// bytes must not come back as a served response.
+	if _, err = c.Write([]byte(smuggled)); err == nil {
+		if err = c.SetReadDeadline(time.Now().Add(testTimeout(time.Second))); err != nil {
+			t.Fatal(err)
+		}
+		var second Response
+		if err = second.Read(br); err == nil {
+			t.Fatalf("expecting a closed connection, got status=%d body=%q", second.StatusCode(), second.Body())
+		}
 	}
-	if err = c.SetReadDeadline(time.Now().Add(testTimeout(time.Second))); err != nil {
-		t.Fatal(err)
-	}
-	var served Response
-	if err = served.Read(br); err != nil {
-		t.Fatalf("unexpected error reading second response: %v", err)
-	}
-	if served.StatusCode() != StatusOK || string(served.Body()) != "HANDLED" {
-		t.Fatalf("handler was skipped for the request after a denied Expect: status=%d body=%q", served.StatusCode(), served.Body())
+	for _, p := range servedPaths {
+		if p == "/smuggled" {
+			t.Fatal("handler ran on bytes smuggled after a denied Expect")
+		}
 	}
 }

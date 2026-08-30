@@ -464,23 +464,6 @@ type Server struct {
 	// CloseOnShutdown when true adds a `Connection: close` header when the server is shutting down.
 	CloseOnShutdown bool
 
-	// ShutdownGracePeriod is how long Shutdown and ShutdownWithContext wait for
-	// in-flight requests before closing the HTTP/1.x connections still serving
-	// them.
-	//
-	// A connection stalled in the middle of a request never returns to idle, so
-	// without this (or a ReadTimeout) a single such client blocks Shutdown for
-	// as long as it holds the connection.
-	//
-	// It applies only to connections the server drives itself. Connections
-	// handed to a NextProto handler (e.g. HTTP/2) or still inside the TLS
-	// handshake are not force-closed here; bound those with ReadTimeout or the
-	// protocol handler's own deadlines.
-	//
-	// A value of zero waits indefinitely, bounded only by the context passed to
-	// ShutdownWithContext.
-	ShutdownGracePeriod time.Duration
-
 	// StreamRequestBody enables request body streaming,
 	// and calls the handler sooner when given body is
 	// larger than the current limit.
@@ -2078,8 +2061,8 @@ func (s *Server) Serve(ln net.Listener) error {
 //
 // A connection stalled in the middle of a request never returns to idle, so a
 // single such client blocks Shutdown for as long as it holds the connection.
-// Set ShutdownGracePeriod, ReadTimeout, or use ShutdownWithContext to bound the
-// wait.
+// Set ReadTimeout to bound that, or use ShutdownWithContext to stop waiting
+// (in-flight requests are left to finish either way).
 func (s *Server) Shutdown() error {
 	return s.ShutdownWithContext(context.Background())
 }
@@ -2093,6 +2076,11 @@ func (s *Server) Shutdown() error {
 //
 // ShutdownWithContext does not close keepalive connections so it's recommended to set ReadTimeout and IdleTimeout
 // to something else than 0.
+//
+// If ctx is done before the server has drained, ShutdownWithContext returns
+// ctx.Err() and stops waiting; in-flight requests and their connections are
+// left to finish on their own. Use ReadTimeout to bound how long a stalled
+// client can hold a connection.
 //
 // When ShutdownWithContext returns errors, any operation to the Server is unavailable.
 func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
@@ -2119,16 +2107,8 @@ func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
 	ticker := time.NewTicker(time.Millisecond * 100)
 	defer ticker.Stop()
 
-	var graceDeadline time.Time
-	if s.ShutdownGracePeriod > 0 {
-		graceDeadline = time.Now().Add(s.ShutdownGracePeriod)
-	}
-
 	for {
-		// Once the grace period is up, force-close the connections still in the
-		// middle of a request that would otherwise keep this loop spinning.
-		force := !graceDeadline.IsZero() && !time.Now().Before(graceDeadline)
-		s.closeConns(force)
+		s.closeIdleConns()
 
 		if open := s.open.Load(); open == 0 {
 			// There may be a pending request to call ctx.Done(). Therefore, we only set it to nil when open == 0.
@@ -2426,14 +2406,12 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		hijackNoResponse bool
 
 		connectionClose bool
-
-		continueReadingRequest bool
 	)
 	for {
 		connRequestNum++
-		// Reset per request: a denied Expect on one request must not suppress
-		// the handler for later requests on the same keep-alive connection.
-		continueReadingRequest = true
+		// Declared per iteration so a denied Expect on one request cannot
+		// suppress the handler for later requests on the same connection.
+		continueReadingRequest := true
 
 		if connRequestNum == 1 {
 			// Apply ReadTimeout to the first request byte.
@@ -2616,6 +2594,10 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 					}
 
 					ctx.SetStatusCode(StatusExpectationFailed)
+					// Close connection since client may have already started sending body data.
+					// br.Reset only drops what was buffered; anything still on the
+					// wire would be parsed as the next request.
+					connectionClose = true
 				}
 			}
 
@@ -3210,18 +3192,11 @@ func (s *Server) writeErrorResponse(bw *bufio.Writer, ctx *RequestCtx, serverNam
 var idleConnTimePool sync.Pool
 
 func (s *Server) closeIdleConns() {
-	s.closeConns(false)
-}
-
-// closeConns closes tracked connections. When force is false only connections
-// that have gone idle are closed; when true every tracked connection is,
-// including ones still in the middle of a request.
-func (s *Server) closeConns(force bool) {
 	s.idleConnsMu.Lock()
 	now := time.Now().Unix()
 	for c, ict := range s.idleConns {
 		t := ict.Load()
-		if force || (t != 0 && now-t >= 0) {
+		if t != 0 && now-t >= 0 {
 			_ = c.Close()
 			// Don't recycle ict: the connection's own goroutine still holds it
 			// and stores into it, so only that goroutine may return it.

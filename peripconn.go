@@ -38,6 +38,30 @@ func (cc *perIPConnCounter) Unregister(ip netip.Addr) {
 	}
 }
 
+// perIPConnState is the per-IP bookkeeping shared by the plain and TLS
+// wrappers. It never clears the embedded connection: Close can race a serving
+// goroutine that is still writing through the wrapper, and nil-ing the conn
+// would turn every promoted method into a nil dereference.
+type perIPConnState struct {
+	counter *perIPConnCounter
+
+	ip     netip.Addr
+	lock   sync.Mutex
+	closed bool
+}
+
+// markClosed reports whether this call is the one that closed the wrapper, so
+// the peer's slot is released exactly once.
+func (s *perIPConnState) markClosed() bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.closed {
+		return false
+	}
+	s.closed = true
+	return true
+}
+
 // perIPConn and perIPTLSConn are allocated per connection rather than pooled:
 // a wrapper returned to a pool can be handed to a new connection while a stale
 // reference to it still exists, and a late Close() on that reference would then
@@ -45,78 +69,58 @@ func (cc *perIPConnCounter) Unregister(ip netip.Addr) {
 type perIPConn struct {
 	net.Conn
 
-	perIPConnCounter *perIPConnCounter
-
-	ip   netip.Addr
-	lock sync.Mutex
+	perIPConnState
 }
 
 type perIPTLSConn struct {
 	*tls.Conn
 
-	perIPConnCounter *perIPConnCounter
-
-	ip   netip.Addr
-	lock sync.Mutex
+	perIPConnState
 }
 
 func acquirePerIPConn(conn net.Conn, ip netip.Addr, counter *perIPConnCounter) net.Conn {
+	// Assigned field by field: perIPConnState holds a mutex, so it must not be
+	// copied by value into the wrapper.
 	if tlsConn, ok := conn.(*tls.Conn); ok {
-		return &perIPTLSConn{
-			perIPConnCounter: counter,
-			Conn:             tlsConn,
-			ip:               ip,
-		}
+		c := &perIPTLSConn{Conn: tlsConn}
+		c.counter = counter
+		c.ip = ip
+		return c
 	}
 
-	return &perIPConn{
-		perIPConnCounter: counter,
-		Conn:             conn,
-		ip:               ip,
-	}
+	c := &perIPConn{Conn: conn}
+	c.counter = counter
+	c.ip = ip
+	return c
 }
 
 func (c *perIPConn) Close() error {
-	c.lock.Lock()
-	cc := c.Conn
-	c.Conn = nil
-	c.lock.Unlock()
-
-	if cc == nil {
+	if !c.markClosed() {
 		return nil
 	}
-
-	err := cc.Close()
-	c.perIPConnCounter.Unregister(c.ip)
+	err := c.Conn.Close()
+	c.counter.Unregister(c.ip)
 	return err
 }
 
 func (c *perIPTLSConn) Close() error {
-	c.lock.Lock()
-	cc := c.Conn
-	c.Conn = nil
-	c.lock.Unlock()
-
-	if cc == nil {
+	if !c.markClosed() {
 		return nil
 	}
-
-	err := cc.Close()
-	c.perIPConnCounter.Unregister(c.ip)
+	err := c.Conn.Close()
+	c.counter.Unregister(c.ip)
 	return err
 }
 
 // getConnIP returns the peer's IP address, keyed so that every distinct client
 // gets its own counter. IPv4-mapped IPv6 addresses are unmapped so they share a
-// bucket with the same IPv4 peer. Non-TCP connections share the zero Addr.
+// bucket with the same IPv4 peer, and the zone is kept so link-local peers on
+// different interfaces stay distinct. The zero Addr is returned for a peer with
+// no usable IP; wrapPerIPConn leaves those connections uncounted.
 func getConnIP(c net.Conn) netip.Addr {
 	addr, ok := c.RemoteAddr().(*net.TCPAddr)
 	if !ok {
 		return netip.Addr{}
 	}
-	ip, ok := netip.AddrFromSlice(addr.IP)
-	if !ok {
-		return netip.Addr{}
-	}
-	return ip.Unmap()
+	return addr.AddrPort().Addr().Unmap()
 }

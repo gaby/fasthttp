@@ -3289,8 +3289,8 @@ func TestResponseHeaderReadSuccess(t *testing.T) {
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 234\r\nContent-Type: foo/bar\r\nContent-Type: baz/bar\r\n\r\n",
 		200, 234, "baz/bar")
 
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 300 OK\r\nContent-Type: foo/barr\r\nTransfer-Encoding: chunked\r\nContent-Length: 354\r\n\r\n",
-		300, -1, "foo/barr")
+	// Content-Length together with chunked framing is rejected on responses too.
+	testResponseHeaderReadError(t, h, "HTTP/1.1 300 OK\r\nContent-Type: foo/barr\r\nTransfer-Encoding: chunked\r\nContent-Length: 354\r\n\r\n")
 
 	// HTTP/1.0 ignores Transfer-Encoding.
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.0 200 OK\r\nTransfer-Encoding: deflate\r\nContent-Length: 5\r\n\r\n",

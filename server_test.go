@@ -10,7 +10,6 @@ import (
 	"io"
 	"mime/multipart"
 	"net"
-	"net/netip"
 	"os"
 	"reflect"
 	"regexp"
@@ -5313,9 +5312,14 @@ func TestTimeoutHandlerStreamRequestBodyClosesConn(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
+	releaseHandler := sync.OnceFunc(func() { close(release) })
 	// Deferred so a failed assertion below doesn't park the handler goroutine.
-	defer close(release)
+	defer releaseHandler()
 	h := TimeoutHandler(func(ctx *RequestCtx) {
+		if string(ctx.Path()) != "/stream" {
+			ctx.SetBodyString(string(ctx.PostBody()))
+			return
+		}
 		close(started)
 		<-release
 		// Keep reading after the timeout: the server must no longer be sharing
@@ -5333,7 +5337,7 @@ func TestTimeoutHandlerStreamRequestBodyClosesConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if _, err = c.Write([]byte("POST / HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n")); err != nil {
+	if _, err = c.Write([]byte("POST /stream HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5353,17 +5357,46 @@ func TestTimeoutHandlerStreamRequestBodyClosesConn(t *testing.T) {
 	if !resp.ConnectionClose() {
 		t.Fatal("expecting 'Connection: close' so the loop stops reading the shared reader")
 	}
+
+	// Let the timed out handler resume reading. Its reader must not have gone
+	// back to the pool, or the next connection reuses it and the two goroutines
+	// race over the same buffer.
+	releaseHandler()
+
+	for i := 0; i < 4; i++ {
+		body := fmt.Sprintf("payload-%d", i)
+		c2, err := ln.Dial()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = fmt.Fprintf(c2, "POST /echo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body); err != nil {
+			t.Fatal(err)
+		}
+		if err = c2.SetReadDeadline(time.Now().Add(testTimeout(time.Second))); err != nil {
+			t.Fatal(err)
+		}
+		var echo Response
+		if err = echo.Read(bufio.NewReader(c2)); err != nil {
+			t.Fatalf("unexpected error on connection %d: %v", i, err)
+		}
+		c2.Close()
+		if got := string(echo.Body()); got != body {
+			t.Fatalf("unexpected body %q on connection %d. Expecting %q", got, i, body)
+		}
+	}
 }
 
 func TestServerContinueHandlerDenyClosesConn(t *testing.T) {
 	t.Parallel()
 
-	var servedPaths []string
+	var servedSmuggled atomic.Bool
 	ln := fasthttputil.NewInmemoryListener()
 	s := &Server{
 		ContinueHandler: func(h *RequestHeader) bool { return false },
 		Handler: func(ctx *RequestCtx) {
-			servedPaths = append(servedPaths, string(ctx.Path()))
+			if string(ctx.Path()) == "/smuggled" {
+				servedSmuggled.Store(true)
+			}
 		},
 	}
 	go s.Serve(ln)     //nolint:errcheck
@@ -5409,10 +5442,8 @@ func TestServerContinueHandlerDenyClosesConn(t *testing.T) {
 			t.Fatalf("expecting a closed connection, got status=%d body=%q", second.StatusCode(), second.Body())
 		}
 	}
-	for _, p := range servedPaths {
-		if p == "/smuggled" {
-			t.Fatal("handler ran on bytes smuggled after a denied Expect")
-		}
+	if servedSmuggled.Load() {
+		t.Fatal("handler ran on bytes smuggled after a denied Expect")
 	}
 }
 
@@ -5432,10 +5463,9 @@ func TestRequestCtxTLSThroughPerIPConn(t *testing.T) {
 	// A TLS connection that isn't literally *tls.Conn goes into the plain
 	// perIPConn wrapper, which promotes nothing beyond net.Conn. Without an
 	// unwrap the TLS accessors silently report a plaintext connection, which
-	// downgrades mTLS handlers. MaxConnsPerIP only wrapped IPv4 peers before
-	// IPv6 keying, so this is reachable for every peer now.
+	// downgrades mTLS handlers.
 	var counter perIPConnCounter
-	ip := netip.MustParseAddr("2001:db8::1")
+	const ip = 123
 	counter.Register(ip)
 	defer counter.Unregister(ip)
 

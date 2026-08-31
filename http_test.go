@@ -1798,42 +1798,45 @@ func TestRequestReadLimitBodyContentLengthAndTransferEncoding(t *testing.T) {
 	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT", 0, ErrBothContentLengthAndTransferEncoding)
 	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT", 0, ErrBothContentLengthAndTransferEncoding)
 
+	// identity is not exempt: an intermediary that honours it as a transfer
+	// coding frames the body differently than one that honours Content-Length.
+	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: identity\r\nContent-Length: 5\r\n\r\nhello", 0, ErrBothContentLengthAndTransferEncoding)
+
 	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 1nope\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 0, ErrNonNumericChars)
 	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 1nope\r\n\r\n0\r\n\r\n", 0, ErrNonNumericChars)
 }
 
-func TestRequestReadLimitBodyIdentityWithContentLength(t *testing.T) {
+func TestRequestReadChunkedLeavesReaderAtNextRequest(t *testing.T) {
 	t.Parallel()
 
-	// identity applies no transfer coding, so Content-Length still frames the
-	// body unambiguously and there is nothing for an intermediary to disagree
-	// about. Only chunked conflicts.
-	for _, s := range []string{
-		"POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: identity\r\nContent-Length: 5\r\n\r\nhello",
-		"POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 5\r\nTransfer-Encoding: identity\r\n\r\nhello",
-	} {
-		var req Request
-		if err := req.Read(bufio.NewReader(bytes.NewBufferString(s))); err != nil {
-			t.Fatalf("unexpected error: %v. s=%q", err, s)
-		}
-		if body := string(req.Body()); body != "hello" {
-			t.Fatalf("unexpected body %q. Expecting %q. s=%q", body, "hello", s)
-		}
+	// Mis-framing a chunked body would leave the reader mid-stream and turn the
+	// leftovers into the next request on a keep-alive connection.
+	var req Request
+	br := bufio.NewReader(bytes.NewBufferString("POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT"))
+	if err := req.ReadLimitBody(br, 0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if body := string(req.Body()); body != "test" {
+		t.Fatalf("unexpected body %q. Expecting %q", body, "test")
+	}
+	b, err := br.Peek(4)
+	if err != nil {
+		t.Fatalf("unexpected error reading remaining bytes: %v", err)
+	}
+	if string(b) != "NEXT" {
+		t.Fatalf("unexpected remaining bytes %q. Expecting %q", b, "NEXT")
 	}
 }
 
-func TestResponseReadContentLengthAndTransferEncoding(t *testing.T) {
+func TestRequestReadLimitBodyContentLengthAndTransferEncodingDisableSpecialHeader(t *testing.T) {
 	t.Parallel()
 
-	// The mirror of the request-side check: left unrejected, the bytes after
-	// the chunked body stay on a pooled keep-alive connection and are served
-	// as the response to whichever request borrows it next.
-	raw := "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" +
-		"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nSMUGGLED!"
-
-	var resp Response
-	err := resp.Read(bufio.NewReader(bytes.NewBufferString(raw)))
-	if !errors.Is(err, ErrBothContentLengthAndTransferEncoding) {
+	// DisableSpecialHeader skips transfer-encoding validation, so a multi-token
+	// value reaches the framing check unrecognised. It must still be rejected.
+	var req Request
+	req.Header.DisableSpecialHeader()
+	raw := "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT"
+	if err := req.ReadLimitBody(bufio.NewReader(bytes.NewBufferString(raw)), 0); !errors.Is(err, ErrBothContentLengthAndTransferEncoding) {
 		t.Fatalf("expecting ErrBothContentLengthAndTransferEncoding, got %v", err)
 	}
 }
@@ -2636,9 +2639,9 @@ func TestResponseReadSuccess(t *testing.T) {
 	testResponseReadSuccess(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nqwer\r\n2\r\nty\r\n0\r\nFoo2: bar2\r\n\r\n",
 		200, -1, "text/html", "qwerty", map[string]string{"Foo2": "bar2"})
 
-	// chunked response with content-length is rejected: the bytes after the
-	// chunked body would otherwise stay on a pooled keep-alive connection.
-	testResponseReadError(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: foo/bar\r\nContent-Length: 123\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\nFoo4:bar4\r\n\r\n")
+	// chunked response with content-length
+	testResponseReadSuccess(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: foo/bar\r\nContent-Length: 123\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\nFoo4:bar4\r\n\r\n",
+		200, -1, "foo/bar", "test", map[string]string{"Foo4": "bar4"})
 
 	// chunked response with empty body
 	testResponseReadSuccess(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nFoo5: bar5\r\n\r\n",

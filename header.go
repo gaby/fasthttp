@@ -481,7 +481,9 @@ var (
 	// ErrBothContentLengthAndTransferEncoding is returned when a request carries
 	// both framing headers. RFC 9112 section 6.1 says such a message ought to be
 	// handled as an error: it is a request smuggling attempt whenever an
-	// intermediary in front of us resolves the conflict the other way.
+	// intermediary in front of us resolves the conflict the other way. Responses
+	// are left alone, since both this parser and net/http tolerate the conflict
+	// there and rejecting it would break clients that talk to such servers today.
 	ErrBothContentLengthAndTransferEncoding = errors.New(
 		"fasthttp: both content-length and transfer-encoding are present")
 	ErrNonNumericChars = errors.New("fasthttp: non-numeric chars found")
@@ -3141,14 +3143,6 @@ func (h *ResponseHeader) parseHeaders(buf []byte) (int, error) {
 		return 0, s.err
 	}
 
-	// Same framing conflict as on the request side. Left unrejected, the bytes
-	// after a chunked body stay on a pooled keep-alive connection and become
-	// the response to whichever request borrows it next.
-	if contentLengthSeen && h.contentLength == -1 {
-		h.connectionClose = true
-		return 0, ErrBothContentLengthAndTransferEncoding
-	}
-
 	if h.contentLength < 0 {
 		h.contentLengthBytes = h.contentLengthBytes[:0]
 	}
@@ -3174,7 +3168,6 @@ func (h *RequestHeader) parseHeaders(buf []byte, blockEnd int) (int, error) {
 
 	contentLengthSeen := false
 	transferEncodingSeen := false
-	transferEncodingChunked := false
 	hostSeen := false
 
 	var s headerScanner
@@ -3243,9 +3236,6 @@ func (h *RequestHeader) parseHeaders(buf []byte, blockEnd int) (int, error) {
 					return 0, errors.New("too many transfer-encoding headers")
 				}
 				transferEncodingSeen = true
-				// Recorded here rather than from h.contentLength: the branch
-				// that sets it is skipped under disableSpecialHeader.
-				transferEncodingChunked = caseInsensitiveCompare(s.value, strChunked)
 			}
 		}
 
@@ -3328,10 +3318,9 @@ func (h *RequestHeader) parseHeaders(buf []byte, blockEnd int) (int, error) {
 	}
 
 	// Checked after the loop so the error doesn't depend on the order the
-	// headers arrive in. Only chunked conflicts with Content-Length:
-	// Transfer-Encoding: identity applies no coding, so the Content-Length
-	// still frames the body unambiguously.
-	if contentLengthSeen && transferEncodingChunked {
+	// headers arrive in, and on the headers as received rather than on
+	// h.contentLength, which disableSpecialHeader leaves unset.
+	if contentLengthSeen && transferEncodingSeen {
 		h.connectionClose = true
 		return 0, ErrBothContentLengthAndTransferEncoding
 	}

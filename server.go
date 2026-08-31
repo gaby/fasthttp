@@ -854,8 +854,8 @@ type tlsConn interface {
 // unwrapPerIPConn returns the connection perIPConn wraps, so the tlsConn
 // assertions below still see a TLS connection when MaxConnsPerIP is set.
 // perIPConn embeds the net.Conn interface and so promotes nothing beyond it;
-// perIPTLSConn embeds *tls.Conn directly and needs no unwrapping. The field is
-// never reassigned after the wrapper is built, so this read needs no lock.
+// perIPTLSConn embeds *tls.Conn directly and needs no unwrapping. The embedded
+// conn is never reassigned, so this read needs no lock.
 func unwrapPerIPConn(c net.Conn) net.Conn {
 	if pic, ok := c.(*perIPConn); ok {
 		return pic.Conn
@@ -1746,7 +1746,7 @@ func (s *Server) NextProto(key string, nph ServeHandler) {
 }
 
 func (s *Server) getNextProto(c net.Conn) (string, error) {
-	if tc, ok := unwrapPerIPConn(c).(tlsConn); ok {
+	if tc, ok := c.(tlsConn); ok {
 		if s.ReadTimeout > 0 {
 			if err := c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
 				return "", err
@@ -2056,18 +2056,13 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 // Shutdown gracefully shuts down the server without interrupting any active connections.
-// Shutdown works by first closing all open listeners and then waiting for all connections
+// Shutdown works by first closing all open listeners and then waiting indefinitely for all connections
 // to return to idle and then shut down.
 //
 // When Shutdown is called, Serve, ListenAndServe, and ListenAndServeTLS immediately return nil.
 // Make sure the program doesn't exit and waits instead for Shutdown to return.
 //
 // Shutdown does not close keepalive connections so it's recommended to set ReadTimeout and IdleTimeout to something else than 0.
-//
-// A connection stalled in the middle of a request never returns to idle, so a
-// single such client blocks Shutdown for as long as it holds the connection.
-// Set ReadTimeout to bound that, or use ShutdownWithContext to stop waiting
-// (in-flight requests are left to finish either way).
 func (s *Server) Shutdown() error {
 	return s.ShutdownWithContext(context.Background())
 }
@@ -2081,11 +2076,6 @@ func (s *Server) Shutdown() error {
 //
 // ShutdownWithContext does not close keepalive connections so it's recommended to set ReadTimeout and IdleTimeout
 // to something else than 0.
-//
-// If ctx is done before the server has drained, ShutdownWithContext returns
-// ctx.Err() and stops waiting; in-flight requests and their connections are
-// left to finish on their own. Use ReadTimeout to bound how long a stalled
-// client can hold a connection.
 //
 // When ShutdownWithContext returns errors, any operation to the Server is unavailable.
 func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
@@ -2173,7 +2163,7 @@ func acceptConn(s *Server, ln net.Listener, lastPerIPErrorTime *time.Time) (net.
 			if pic == nil {
 				if time.Since(*lastPerIPErrorTime) > time.Minute {
 					s.logger().Printf("The number of connections from %s exceeds MaxConnsPerIP=%d",
-						getConnIP(c), s.MaxConnsPerIP)
+						getConnIP4(c), s.MaxConnsPerIP)
 					*lastPerIPErrorTime = time.Now()
 				}
 				continue
@@ -2185,9 +2175,8 @@ func acceptConn(s *Server, ln net.Listener, lastPerIPErrorTime *time.Time) (net.
 }
 
 func wrapPerIPConn(s *Server, c net.Conn) net.Conn {
-	ip := getConnIP(c)
-	if !ip.IsValid() {
-		// Not a TCP connection, so there is no peer address to count against.
+	ip := getUint32IP(c)
+	if ip == 0 {
 		return c
 	}
 	n := s.perIPConnCounter.Register(ip)
@@ -2414,8 +2403,8 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 	)
 	for {
 		connRequestNum++
-		// Declared per iteration so a denied Expect on one request cannot
-		// suppress the handler for later requests on the same connection.
+		// Scoped to the iteration so a denied Expect cannot leak into a later
+		// request on the same connection.
 		continueReadingRequest := true
 
 		if connRequestNum == 1 {
@@ -2953,6 +2942,9 @@ func acquireReader(ctx *RequestCtx) *bufio.Reader {
 }
 
 func releaseReader(s *Server, r *bufio.Reader) {
+	// Detach the connection: a pooled reader otherwise keeps the last one it
+	// served alive until the entry is reused.
+	r.Reset(nil)
 	s.readerPool.Put(r)
 }
 
@@ -2971,6 +2963,7 @@ func acquireWriter(ctx *RequestCtx) *bufio.Writer {
 }
 
 func releaseWriter(s *Server, w *bufio.Writer) {
+	w.Reset(nil)
 	s.writerPool.Put(w)
 }
 

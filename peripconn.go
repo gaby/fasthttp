@@ -3,19 +3,18 @@ package fasthttp
 import (
 	"crypto/tls"
 	"net"
-	"net/netip"
 	"sync"
 )
 
 type perIPConnCounter struct {
-	m    map[netip.Addr]int
+	m    map[uint32]int
 	lock sync.Mutex
 }
 
-func (cc *perIPConnCounter) Register(ip netip.Addr) int {
+func (cc *perIPConnCounter) Register(ip uint32) int {
 	cc.lock.Lock()
 	if cc.m == nil {
-		cc.m = make(map[netip.Addr]int)
+		cc.m = make(map[uint32]int)
 	}
 	n := cc.m[ip] + 1
 	cc.m[ip] = n
@@ -23,7 +22,7 @@ func (cc *perIPConnCounter) Register(ip netip.Addr) int {
 	return n
 }
 
-func (cc *perIPConnCounter) Unregister(ip netip.Addr) {
+func (cc *perIPConnCounter) Unregister(ip uint32) {
 	cc.lock.Lock()
 	defer cc.lock.Unlock()
 	if cc.m == nil {
@@ -39,13 +38,19 @@ func (cc *perIPConnCounter) Unregister(ip netip.Addr) {
 }
 
 // perIPConnState is the per-IP bookkeeping shared by the plain and TLS
-// wrappers. It never clears the embedded connection: Close can race a serving
-// goroutine that is still writing through the wrapper, and nil-ing the conn
-// would turn every promoted method into a nil dereference.
+// wrappers. The embedded connection is never cleared: Close can race a serving
+// goroutine that is still writing through the wrapper, and the promoted methods
+// read the embedded field without the lock, so clearing it would both race and
+// turn those calls into nil dereferences.
+//
+// The wrappers are also never pooled. A recycled wrapper can be handed to a new
+// connection while a stale reference to it still exists, and a late Close on
+// that reference would then close an unrelated connection and unregister the
+// wrong IP.
 type perIPConnState struct {
 	counter *perIPConnCounter
 
-	ip     netip.Addr
+	ip     uint32
 	lock   sync.Mutex
 	closed bool
 }
@@ -62,10 +67,6 @@ func (s *perIPConnState) markClosed() bool {
 	return true
 }
 
-// perIPConn and perIPTLSConn are allocated per connection rather than pooled:
-// a wrapper returned to a pool can be handed to a new connection while a stale
-// reference to it still exists, and a late Close() on that reference would then
-// close an unrelated connection and unregister the wrong IP.
 type perIPConn struct {
 	net.Conn
 
@@ -78,20 +79,18 @@ type perIPTLSConn struct {
 	perIPConnState
 }
 
-func acquirePerIPConn(conn net.Conn, ip netip.Addr, counter *perIPConnCounter) net.Conn {
-	// Assigned field by field: perIPConnState holds a mutex, so it must not be
-	// copied by value into the wrapper.
+func acquirePerIPConn(conn net.Conn, ip uint32, counter *perIPConnCounter) net.Conn {
 	if tlsConn, ok := conn.(*tls.Conn); ok {
-		c := &perIPTLSConn{Conn: tlsConn}
-		c.counter = counter
-		c.ip = ip
-		return c
+		return &perIPTLSConn{
+			Conn:           tlsConn,
+			perIPConnState: perIPConnState{counter: counter, ip: ip},
+		}
 	}
 
-	c := &perIPConn{Conn: conn}
-	c.counter = counter
-	c.ip = ip
-	return c
+	return &perIPConn{
+		Conn:           conn,
+		perIPConnState: perIPConnState{counter: counter, ip: ip},
+	}
 }
 
 func (c *perIPConn) Close() error {
@@ -112,15 +111,20 @@ func (c *perIPTLSConn) Close() error {
 	return err
 }
 
-// getConnIP returns the peer's IP address, keyed so that every distinct client
-// gets its own counter. IPv4-mapped IPv6 addresses are unmapped so they share a
-// bucket with the same IPv4 peer, and the zone is kept so link-local peers on
-// different interfaces stay distinct. The zero Addr is returned for a peer with
-// no usable IP; wrapPerIPConn leaves those connections uncounted.
-func getConnIP(c net.Conn) netip.Addr {
-	addr, ok := c.RemoteAddr().(*net.TCPAddr)
-	if !ok {
-		return netip.Addr{}
+func getUint32IP(c net.Conn) uint32 {
+	ip := getConnIP4(c)
+
+	if len(ip) != 4 {
+		return 0
 	}
-	return addr.AddrPort().Addr().Unmap()
+	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+}
+
+func getConnIP4(c net.Conn) net.IP {
+	addr := c.RemoteAddr()
+	ipAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return net.IPv4zero
+	}
+	return ipAddr.IP.To4()
 }

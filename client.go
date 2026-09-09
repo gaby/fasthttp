@@ -1039,6 +1039,12 @@ type clientConn struct {
 
 	createdTime time.Time
 	lastUseTime time.Time
+
+	// readDeadlineSet and writeDeadlineSet record whether c currently has a
+	// deadline, so a request without timeouts can skip clearing one that was
+	// never set.
+	readDeadlineSet  bool
+	writeDeadlineSet bool
 }
 
 // Conn returns the underlying net.Conn associated with the client connection.
@@ -2089,6 +2095,8 @@ func acquireClientConn(conn net.Conn) *clientConn {
 	cc := v.(*clientConn) //nolint:forcetypeassert
 	cc.c = conn
 	cc.createdTime = time.Now()
+	cc.readDeadlineSet = true
+	cc.writeDeadlineSet = true
 	return cc
 }
 
@@ -2101,6 +2109,13 @@ func releaseClientConn(cc *clientConn) {
 var clientConnPool sync.Pool
 
 func (c *HostClient) ReleaseConn(cc *clientConn) {
+	// The caller may have changed the deadlines through cc.Conn().
+	cc.readDeadlineSet = true
+	cc.writeDeadlineSet = true
+	c.releaseConn(cc)
+}
+
+func (c *HostClient) releaseConn(cc *clientConn) {
 	cc.lastUseTime = time.Now()
 	if c.MaxConnWaitTimeout <= 0 {
 		c.connsLock.Lock()
@@ -3420,9 +3435,12 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		}
 	}
 
-	if err = conn.SetWriteDeadline(writeDeadline); err != nil {
-		hc.CloseConn(cc)
-		return true, err
+	if !writeDeadline.IsZero() || cc.writeDeadlineSet {
+		if err = conn.SetWriteDeadline(writeDeadline); err != nil {
+			hc.CloseConn(cc)
+			return true, err
+		}
+		cc.writeDeadlineSet = !writeDeadline.IsZero()
 	}
 
 	resetConnection := false
@@ -3461,9 +3479,12 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		}
 	}
 
-	if err = conn.SetReadDeadline(readDeadline); err != nil {
-		hc.CloseConn(cc)
-		return true, err
+	if !readDeadline.IsZero() || cc.readDeadlineSet {
+		if err = conn.SetReadDeadline(readDeadline); err != nil {
+			hc.CloseConn(cc)
+			return true, err
+		}
+		cc.readDeadlineSet = !readDeadline.IsZero()
 	}
 
 	if customSkipBody || req.Header.IsHead() {
@@ -3492,7 +3513,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 			if closeConn || discard || resp.ConnectionClose() {
 				hc.CloseConn(cc)
 			} else {
-				hc.ReleaseConn(cc)
+				hc.releaseConn(cc)
 			}
 		}
 		// ReadLimitBody always creates a network-backed requestStream when
@@ -3518,7 +3539,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	if closeConn {
 		hc.CloseConn(cc)
 	} else {
-		hc.ReleaseConn(cc)
+		hc.releaseConn(cc)
 	}
 	return false, nil
 }

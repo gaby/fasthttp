@@ -347,6 +347,12 @@ func (h *ResponseHeader) SetServerBytes(server []byte) {
 	h.server = initHeaderValueBytes(h.server, server)
 }
 
+// setServerSanitized sets Server header value from bytes that are known to
+// contain no CR or LF.
+func (h *ResponseHeader) setServerSanitized(server []byte) {
+	h.server = append(h.server[:0], server...)
+}
+
 // ContentType returns Content-Type header value.
 func (h *RequestHeader) ContentType() []byte {
 	if h.disableSpecialHeader {

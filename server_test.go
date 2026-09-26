@@ -4531,8 +4531,10 @@ func TestShutdown(t *testing.T) {
 	t.Parallel()
 
 	ln := fasthttputil.NewInmemoryListener()
+	handlerStarted := make(chan struct{})
 	s := &Server{
 		Handler: func(ctx *RequestCtx) {
+			close(handlerStarted)
 			time.Sleep(time.Millisecond * 500)
 			ctx.Success("aaa/bbb", []byte("real response"))
 		},
@@ -4564,7 +4566,11 @@ func TestShutdown(t *testing.T) {
 		verifyResponseHeaderConnection(t, &resp.Header, "")
 		clientCh <- struct{}{}
 	}()
-	time.Sleep(time.Millisecond * 100)
+	select {
+	case <-handlerStarted:
+	case <-time.After(testTimeout(time.Second)):
+		t.Fatal("handler didn't start")
+	}
 	shutdownCh := make(chan struct{})
 	go func() {
 		if err := s.Shutdown(); err != nil {

@@ -2436,9 +2436,11 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		isHTTP11        bool
 
 		continueReadingRequest = true
+		mayContinue            bool
 	)
 	for {
 		connRequestNum++
+		mayContinue = false
 
 		if connRequestNum == 1 {
 			// Apply ReadTimeout to the first request byte.
@@ -2564,9 +2566,9 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 				if err == nil {
 					// read body
 					if s.StreamRequestBody {
-						err = ctx.Request.readBodyStream(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
+						mayContinue, err = ctx.Request.readBodyStream(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
 					} else {
-						err = ctx.Request.readLimitBody(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
+						mayContinue, err = ctx.Request.readLimitBody(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
 					}
 				}
 			}
@@ -2602,7 +2604,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 
 		// 'Expect: 100-continue' request handling.
 		// See https://www.rfc-editor.org/rfc/rfc9110.html#field.expect for details.
-		if ctx.Request.MayContinue() {
+		if mayContinue {
 			// Allow the ability to deny reading the incoming request body.
 			if s.ExpectHandler != nil {
 				if expectStatus := s.ExpectHandler(ctx); expectStatus != StatusContinue {

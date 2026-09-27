@@ -3,6 +3,7 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -566,21 +567,16 @@ func isValidTrailerKey(key []byte) bool {
 	return true
 }
 
-// validHeaderValue returns true if every byte of b is a valid header value
-// byte as defined by RFC 7230.
-func validHeaderValue(b []byte) bool {
-	// Words without control bytes are skipped eight at a time. A tab is a
-	// valid value byte but also a control byte, so a word holding one is
-	// checked byte by byte.
-	for len(b) >= 8 && !anyByteIsCTL(loadWord(b)) {
+// skipCleanWords returns b without its leading whole words that hold no
+// control byte, so a caller validating b byte by byte only visits the rest.
+// A tab is a valid value byte but also a control byte, so a word holding one
+// is left to the caller. The word is loaded here rather than through
+// loadWord to keep the function within the inlining budget.
+func skipCleanWords(b []byte) []byte {
+	for len(b) >= 8 && !anyByteIsCTL(binary.LittleEndian.Uint64(b)) {
 		b = b[8:]
 	}
-	for _, c := range b {
-		if !validHeaderValueByte(c) {
-			return false
-		}
-	}
-	return true
+	return b
 }
 
 // validHeaderFieldByte returns true if c valid header field byte
@@ -2834,8 +2830,10 @@ func parseTrailer(src []byte, dest []argsKV, disableNormalizing bool) ([]argsKV,
 		if isBadTrailer(s.key) {
 			return dest, 0, fmt.Errorf("forbidden trailer key %q", s.key)
 		}
-		if !validHeaderValue(s.value) {
-			return dest, 0, fmt.Errorf("invalid trailer value %q", s.value)
+		for _, ch := range skipCleanWords(s.value) {
+			if !validHeaderValueByte(ch) {
+				return dest, 0, fmt.Errorf("invalid trailer value %q", s.value)
+			}
 		}
 		normalizeHeaderKeyValidated(s.key, disable)
 		dest = appendArgBytes(dest, s.key, s.value, argsHasValue)
@@ -3144,9 +3142,11 @@ func (h *ResponseHeader) parseHeaders(buf []byte) (int, error) {
 		}
 		normalizeHeaderKeyValidated(s.key, disableNormalizing)
 
-		if !validHeaderValue(s.value) {
-			h.connectionClose = true
-			return 0, fmt.Errorf("invalid header value %q", s.value)
+		for _, ch := range skipCleanWords(s.value) {
+			if !validHeaderValueByte(ch) {
+				h.connectionClose = true
+				return 0, fmt.Errorf("invalid header value %q", s.value)
+			}
 		}
 
 		switch s.key[0] | 0x20 {
@@ -3287,9 +3287,11 @@ func (h *RequestHeader) parseHeaders(buf []byte, blockEnd int) (int, error) {
 		// Key bytes were already validated by the scanner.
 		normalizeHeaderKeyValidated(s.key, h.disableNormalizing || s.keyHasSpace)
 
-		if !validHeaderValue(s.value) {
-			h.connectionClose = true
-			return 0, fmt.Errorf("invalid header value %q", s.value)
+		for _, ch := range skipCleanWords(s.value) {
+			if !validHeaderValueByte(ch) {
+				h.connectionClose = true
+				return 0, fmt.Errorf("invalid header value %q", s.value)
+			}
 		}
 
 		isContentLength := false

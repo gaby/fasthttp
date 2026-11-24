@@ -151,7 +151,7 @@ func stacklessWriteBrotli(ctx any) {
 	stacklessWriteBrotliOnce.Do(func() {
 		stacklessWriteBrotliFunc = stackless.NewFunc(nonblockingWriteBrotli)
 	})
-	stacklessWriteBrotliFunc(ctx)
+	runStackless(stacklessWriteBrotliFunc, nonblockingWriteBrotli, ctx)
 }
 
 func nonblockingWriteBrotli(ctxv any) {

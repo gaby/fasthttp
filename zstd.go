@@ -171,7 +171,7 @@ func stacklessWriteZstd(ctx any) {
 	stacklessWriteZstdOnce.Do(func() {
 		stacklessWriteZstdFunc = stackless.NewFunc(nonblockingWriteZstd)
 	})
-	stacklessWriteZstdFunc(ctx)
+	runStackless(stacklessWriteZstdFunc, nonblockingWriteZstd, ctx)
 }
 
 func nonblockingWriteZstd(ctxv any) {

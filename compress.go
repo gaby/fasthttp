@@ -196,7 +196,7 @@ func stacklessWriteGzip(ctx any) {
 	stacklessWriteGzipOnce.Do(func() {
 		stacklessWriteGzipFunc = stackless.NewFunc(nonblockingWriteGzip)
 	})
-	stacklessWriteGzipFunc(ctx)
+	runStackless(stacklessWriteGzipFunc, nonblockingWriteGzip, ctx)
 }
 
 func nonblockingWriteGzip(ctxv any) {
@@ -327,7 +327,7 @@ func stacklessWriteDeflate(ctx any) {
 	stacklessWriteDeflateOnce.Do(func() {
 		stacklessWriteDeflateFunc = stackless.NewFunc(nonblockingWriteDeflate)
 	})
-	stacklessWriteDeflateFunc(ctx)
+	runStackless(stacklessWriteDeflateFunc, nonblockingWriteDeflate, ctx)
 }
 
 func nonblockingWriteDeflate(ctxv any) {
@@ -351,6 +351,16 @@ type compressCtx struct {
 	level int
 }
 
+// runStackless runs f(ctx) through sf, the stackless wrapper of f, or on the
+// calling goroutine when sf refuses it because the workers' queue is full.
+// The caller waits for the output, and dropping it would send a response
+// with a Content-Encoding header and an empty or cut-short body.
+func runStackless(sf func(ctx any) bool, f func(ctx any), ctx any) {
+	if !sf(ctx) {
+		f(ctx)
+	}
+}
+
 // inlineCompressSlots lets gzip, deflate and brotli run on the goroutine
 // that asks for them instead of a stackless worker.
 //
@@ -369,9 +379,14 @@ type compressCtx struct {
 // accept brotli, stays on its workers.
 //
 // The workers also bound how many compressors are in use at a time, each
-// holding about a megabyte of state, to their number, GOMAXPROCS. There
-// are as many inline slots, and a compression that finds them all taken
-// queues for the workers as before, so the bound stays O(GOMAXPROCS).
+// holding about a megabyte of state: every algorithm has its own pool of
+// GOMAXPROCS workers. The inline slots, GOMAXPROCS of them shared by all
+// algorithms, add at most that many more, and a compression that finds them
+// all taken queues for the workers as before, so the bound stays
+// O(GOMAXPROCS). Only one that also finds the workers' queue full,
+// GOMAXPROCS*2048 deep, runs on its caller without a slot, rather than lose
+// its output. Like the worker pools, the number of slots is fixed from
+// GOMAXPROCS on first use and doesn't follow later changes to it.
 var inlineCompressSlots compressSlots
 
 type compressSlots struct {

@@ -499,3 +499,28 @@ func TestInlineCompressSlotsBound(t *testing.T) {
 		t.Fatalf("%d compressions don't decompress to their input", n)
 	}
 }
+
+func TestRunStacklessRunsRefusedWork(t *testing.T) {
+	t.Parallel()
+
+	src := createFixedBody(1e4)
+	var want byteSliceWriter
+	writeGzipNow(&want, src, CompressDefaultCompression)
+
+	// A wrapper that took the work leaves nothing for the caller to do.
+	var taken byteSliceWriter
+	ctx := &compressCtx{w: &taken, p: src, level: CompressDefaultCompression}
+	runStackless(func(any) bool { return true }, nonblockingWriteGzip, ctx)
+	if len(taken.b) != 0 {
+		t.Fatal("work a stackless worker took ran on the caller too")
+	}
+
+	// One that refused it, as stackless.NewFunc does when its queue is full,
+	// leaves the caller to compress.
+	var refused byteSliceWriter
+	ctx = &compressCtx{w: &refused, p: src, level: CompressDefaultCompression}
+	runStackless(func(any) bool { return false }, nonblockingWriteGzip, ctx)
+	if !bytes.Equal(refused.b, want.b) {
+		t.Fatal("work the stackless workers refused wasn't compressed on the caller")
+	}
+}

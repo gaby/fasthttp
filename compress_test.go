@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -326,5 +329,153 @@ func TestAppendUncompressBytesWithLimitBomb(t *testing.T) {
 				t.Fatalf("%d bytes were decoded with the limit %d", len(got), maxBodySize)
 			}
 		})
+	}
+}
+
+func TestCompressSlots(t *testing.T) {
+	t.Parallel()
+
+	s := compressSlots{limit: 2}
+	s.once.Do(func() {})
+	if !s.tryAcquire() || !s.tryAcquire() {
+		t.Fatal("cannot take a free slot")
+	}
+	if s.tryAcquire() {
+		t.Fatal("took a slot beyond the limit")
+	}
+	s.release()
+	if !s.tryAcquire() {
+		t.Fatal("cannot take a released slot")
+	}
+	if n := s.inUse.Load(); n != 2 {
+		t.Fatalf("%d slots in use, want 2", n)
+	}
+}
+
+var takeInlineCompressSlotsMu sync.Mutex
+
+// takeInlineCompressSlots holds every inline compression slot until the
+// returned function is called, so that compressions in the meantime go to
+// the stackless workers. It waits for slots other tests hold.
+func takeInlineCompressSlots() (release func()) {
+	takeInlineCompressSlotsMu.Lock()
+	inlineCompressSlots.init()
+	held := int64(0)
+	for held < inlineCompressSlots.limit {
+		if inlineCompressSlots.tryAcquire() {
+			held++
+		} else {
+			runtime.Gosched()
+		}
+	}
+	return func() {
+		for range held {
+			inlineCompressSlots.release()
+		}
+		takeInlineCompressSlotsMu.Unlock()
+	}
+}
+
+func TestCompressInlineMatchesStackless(t *testing.T) {
+	t.Parallel()
+
+	for _, level := range []int{
+		CompressHuffmanOnly, CompressNoCompression, CompressBestSpeed, 2, 3, 4, 5,
+		CompressDefaultCompression, 7, 8, CompressBestCompression,
+	} {
+		for _, s := range compressTestcases {
+			src := []byte(s)
+
+			var inlineGz, workerGz byteSliceWriter
+			writeGzipNow(&inlineGz, src, level)
+			stacklessWriteGzip(&compressCtx{w: &workerGz, p: src, level: level})
+			if !bytes.Equal(inlineGz.b, workerGz.b) {
+				t.Fatalf("level %d: gzip inline and on a worker differ for %d bytes", level, len(src))
+			}
+
+			var inlineDf, workerDf byteSliceWriter
+			writeDeflateNow(&inlineDf, src, level)
+			stacklessWriteDeflate(&compressCtx{w: &workerDf, p: src, level: level})
+			if !bytes.Equal(inlineDf.b, workerDf.b) {
+				t.Fatalf("level %d: deflate inline and on a worker differ for %d bytes", level, len(src))
+			}
+		}
+	}
+}
+
+func TestCompressWithoutInlineSlot(t *testing.T) {
+	t.Parallel()
+
+	src := createFixedBody(1e4)
+	var wantGz, wantDf byteSliceWriter
+	writeGzipNow(&wantGz, src, CompressDefaultCompression)
+	writeDeflateNow(&wantDf, src, CompressDefaultCompression)
+
+	release := takeInlineCompressSlots()
+	defer release()
+
+	// With every slot taken the compressions queue for the stackless
+	// workers, and the writers that may block take their stackless writer.
+	if gz := AppendGzipBytesLevel(nil, src, CompressDefaultCompression); !bytes.Equal(gz, wantGz.b) {
+		t.Fatal("unexpected gzip output from a stackless worker")
+	}
+	if df := AppendDeflateBytesLevel(nil, src, CompressDefaultCompression); !bytes.Equal(df, wantDf.b) {
+		t.Fatal("unexpected deflate output from a stackless worker")
+	}
+	var buf bytes.Buffer
+	if _, err := WriteGzipLevel(&buf, src, CompressDefaultCompression); err != nil || !bytes.Equal(buf.Bytes(), wantGz.b) {
+		t.Fatalf("unexpected gzip output to a bytes.Buffer from a stackless worker: %v", err)
+	}
+	if n := inlineCompressSlots.inUse.Load(); n != inlineCompressSlots.limit {
+		t.Fatalf("%d inline slots in use while the test holds all %d", n, inlineCompressSlots.limit)
+	}
+}
+
+func TestInlineCompressSlotsBound(t *testing.T) {
+	t.Parallel()
+
+	inlineCompressSlots.init()
+	limit := inlineCompressSlots.limit
+	src := createFixedBody(1e4)
+
+	stop := make(chan struct{})
+	sampled := make(chan int64)
+	go func() {
+		var maxInUse int64
+		for {
+			select {
+			case <-stop:
+				sampled <- maxInUse
+				return
+			default:
+			}
+			maxInUse = max(maxInUse, inlineCompressSlots.inUse.Load())
+			runtime.Gosched()
+		}
+	}()
+
+	var wg sync.WaitGroup
+	var failures atomic.Int64
+	for range 4 * max(limit, 2) {
+		wg.Go(func() {
+			for range 20 {
+				gz := AppendGzipBytesLevel(nil, src, CompressBestSpeed)
+				if got, err := AppendGunzipBytes(nil, gz); err != nil || !bytes.Equal(got, src) {
+					failures.Add(1)
+				}
+				df := AppendDeflateBytesLevel(nil, src, CompressBestSpeed)
+				if got, err := AppendInflateBytes(nil, df); err != nil || !bytes.Equal(got, src) {
+					failures.Add(1)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(stop)
+	if maxInUse := <-sampled; maxInUse > limit {
+		t.Fatalf("%d inline compressions at once, want at most %d", maxInUse, limit)
+	}
+	if n := failures.Load(); n > 0 {
+		t.Fatalf("%d compressions don't decompress to their input", n)
 	}
 }

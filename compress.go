@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/flate"
 	"github.com/klauspost/compress/gzip"
@@ -162,13 +164,18 @@ func WriteGzipLevel(w io.Writer, p []byte, level int) (int, error) {
 	case *byteSliceWriter,
 		*bytes.Buffer,
 		*bytebufferpool.ByteBuffer:
-		// These writers don't block, so we can just use stacklessWriteGzip
-		ctx := &compressCtx{
+		// These writers don't block, so the compression can run right
+		// here, or on a stackless worker when no inline slot is free.
+		if inlineCompressSlots.tryAcquire() {
+			defer inlineCompressSlots.release()
+			writeGzipNow(w, p, level)
+			return len(p), nil
+		}
+		stacklessWriteGzip(&compressCtx{
 			w:     w,
 			p:     p,
 			level: level,
-		}
-		stacklessWriteGzip(ctx)
+		})
 		return len(p), nil
 	default:
 		zw := acquireStacklessGzipWriter(w, level)
@@ -194,11 +201,16 @@ func stacklessWriteGzip(ctx any) {
 
 func nonblockingWriteGzip(ctxv any) {
 	ctx := ctxv.(*compressCtx) //nolint:forcetypeassert
-	zw := acquireRealGzipWriter(ctx.w, ctx.level)
+	writeGzipNow(ctx.w, ctx.p, ctx.level)
+}
 
-	zw.Write(ctx.p) //nolint:errcheck // no way to handle this error anyway
+// writeGzipNow gzips p to w, which must not block, on the calling goroutine.
+func writeGzipNow(w io.Writer, p []byte, level int) {
+	zw := acquireRealGzipWriter(w, level)
 
-	releaseRealGzipWriter(zw, ctx.level)
+	zw.Write(p) //nolint:errcheck // no way to handle this error anyway
+
+	releaseRealGzipWriter(zw, level)
 }
 
 // WriteGzip writes gzipped p to w and returns the number of compressed
@@ -283,13 +295,18 @@ func WriteDeflateLevel(w io.Writer, p []byte, level int) (int, error) {
 	case *byteSliceWriter,
 		*bytes.Buffer,
 		*bytebufferpool.ByteBuffer:
-		// These writers don't block, so we can just use stacklessWriteDeflate
-		ctx := &compressCtx{
+		// These writers don't block, so the compression can run right
+		// here, or on a stackless worker when no inline slot is free.
+		if inlineCompressSlots.tryAcquire() {
+			defer inlineCompressSlots.release()
+			writeDeflateNow(w, p, level)
+			return len(p), nil
+		}
+		stacklessWriteDeflate(&compressCtx{
 			w:     w,
 			p:     p,
 			level: level,
-		}
-		stacklessWriteDeflate(ctx)
+		})
 		return len(p), nil
 	default:
 		zw := acquireStacklessDeflateWriter(w, level)
@@ -315,17 +332,72 @@ func stacklessWriteDeflate(ctx any) {
 
 func nonblockingWriteDeflate(ctxv any) {
 	ctx := ctxv.(*compressCtx) //nolint:forcetypeassert
-	zw := acquireRealDeflateWriter(ctx.w, ctx.level)
+	writeDeflateNow(ctx.w, ctx.p, ctx.level)
+}
 
-	zw.Write(ctx.p) //nolint:errcheck // no way to handle this error anyway
+// writeDeflateNow deflates p to w, which must not block, on the calling
+// goroutine.
+func writeDeflateNow(w io.Writer, p []byte, level int) {
+	zw := acquireRealDeflateWriter(w, level)
 
-	releaseRealDeflateWriter(zw, ctx.level)
+	zw.Write(p) //nolint:errcheck // no way to handle this error anyway
+
+	releaseRealDeflateWriter(zw, level)
 }
 
 type compressCtx struct {
 	w     io.Writer
 	p     []byte
 	level int
+}
+
+// inlineCompressSlots lets gzip and deflate run on the goroutine that asks
+// for them instead of a stackless worker.
+//
+// Handing the work to a worker and waiting for it takes two goroutine
+// switches. On a server with idle Ps each one wakes an OS thread, and
+// together they took a third of the time AppendGzipBytesLevel spent on
+// 6 KB of JSON at CompressBestSpeed. The flate compressors fit within the
+// stack a goroutine serving a request already has, so running them inline
+// doesn't grow it, which is what the workers are there to prevent. Brotli
+// and zstd need two to four times as much stack and stay on their workers.
+//
+// The workers also bound how many compressors are in use at a time, each
+// holding about a megabyte of state, to their number, GOMAXPROCS. There
+// are as many inline slots, and a compression that finds them all taken
+// queues for the workers as before, so the bound stays O(GOMAXPROCS).
+var inlineCompressSlots compressSlots
+
+type compressSlots struct {
+	once  sync.Once
+	limit int64
+	inUse atomic.Int64
+}
+
+// init sets the number of slots on first use, as stackless.NewFunc sizes its
+// worker pool.
+func (s *compressSlots) init() {
+	s.once.Do(func() {
+		s.limit = int64(runtime.GOMAXPROCS(-1))
+	})
+}
+
+// tryAcquire takes a slot if one is free. inUse never exceeds limit.
+func (s *compressSlots) tryAcquire() bool {
+	s.init()
+	for {
+		n := s.inUse.Load()
+		if n >= s.limit {
+			return false
+		}
+		if s.inUse.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+func (s *compressSlots) release() {
+	s.inUse.Add(-1)
 }
 
 // WriteDeflate writes deflated p to w and returns the number of compressed

@@ -606,79 +606,57 @@ type cookieScanner struct {
 	b []byte
 }
 
-func (s *cookieScanner) nextRaw(key, val *[]byte) bool {
+// segment returns the bytes up to the next ';', the separator between
+// cookies, and moves past it and the space that may follow it. Cookie values
+// run to tens of bytes, tokens, base64 blobs or form-encoded state, so a
+// vectorized search for the separator beats visiting every byte.
+func (s *cookieScanner) segment() ([]byte, bool) {
 	b := s.b
 	if len(b) == 0 {
+		return nil, false
+	}
+	i := bytes.IndexByte(b, ';')
+	if i < 0 {
+		s.b = b[len(b):]
+		return b, true
+	}
+	j := i + 1
+	if j < len(b) && b[j] == ' ' {
+		j++
+	}
+	s.b = b[j:]
+	return b[:i], true
+}
+
+func (s *cookieScanner) nextRaw(key, val *[]byte) bool {
+	seg, ok := s.segment()
+	if !ok {
 		return false
 	}
-
-	isKey := true
-	k := 0
-	for i, c := range b {
-		switch c {
-		case '=':
-			if isKey {
-				isKey = false
-				*key = trimCookieArgNoCopy(b[:i], false)
-				k = i + 1
-			}
-		case ';':
-			if isKey {
-				*key = (*key)[:0]
-			}
-			*val = trimCookieArgNoCopy(b[k:i], true)
-			j := i + 1
-			if j < len(b) && b[j] == ' ' {
-				j++
-			}
-			s.b = b[j:]
-			return true
-		}
-	}
-
-	if isKey {
+	// The name ends at the first '='; any later one belongs to the value.
+	if i := bytes.IndexByte(seg, '='); i >= 0 {
+		*key = trimCookieArgNoCopy(seg[:i], false)
+		*val = trimCookieArgNoCopy(seg[i+1:], true)
+	} else {
 		*key = (*key)[:0]
+		*val = trimCookieArgNoCopy(seg, true)
 	}
-	*val = trimCookieArgNoCopy(b[k:], true)
-	s.b = b[len(b):]
 	return true
 }
 
 func (s *cookieScanner) next(key, val *[]byte) bool {
-	b := s.b
-	if len(b) == 0 {
+	seg, ok := s.segment()
+	if !ok {
 		return false
 	}
-
-	isKey := true
-	k := 0
-	for i, c := range b {
-		switch c {
-		case '=':
-			if isKey {
-				isKey = false
-				*key = decodeCookieArg(*key, b[:i], false)
-				k = i + 1
-			}
-		case ';':
-			if isKey {
-				*key = (*key)[:0]
-			}
-			*val = decodeCookieArg(*val, b[k:i], true)
-			j := i + 1
-			if j < len(b) && b[j] == ' ' {
-				j++
-			}
-			s.b = b[j:]
-			return true
-		}
-	}
-
-	if isKey {
+	// The name ends at the first '='; any later one belongs to the value.
+	if i := bytes.IndexByte(seg, '='); i >= 0 {
+		*key = decodeCookieArg(*key, seg[:i], false)
+		*val = decodeCookieArg(*val, seg[i+1:], true)
+	} else {
 		*key = (*key)[:0]
+		*val = decodeCookieArg(*val, seg, true)
 	}
-	*val = decodeCookieArg(*val, b[k:], true)
-	s.b = b[len(b):]
 	return true
 }
 
@@ -699,13 +677,26 @@ func decodeCookieArg(dst, src []byte, skipQuotes bool) []byte {
 	return append(dst[:0], src...)
 }
 
+// validCookieValue reports whether value holds none of the bytes a cookie
+// value can't carry: '"', ';' and '\'. It checks eight bytes at a time; the
+// tail of a value of eight bytes or more is checked as an overlapping last
+// word, so only shorter values take the byte loop.
 func validCookieValue(value []byte) bool {
-	for _, c := range value {
-		if c == '"' || c == ';' || c == '\\' {
+	n := len(value)
+	if n < 8 {
+		for _, c := range value {
+			if c == '"' || c == ';' || c == '\\' {
+				return false
+			}
+		}
+		return true
+	}
+	for i := 0; i+8 <= n; i += 8 {
+		if anyCookieValueStop(loadWord(value[i:])) {
 			return false
 		}
 	}
-	return true
+	return n%8 == 0 || !anyCookieValueStop(loadWord(value[n-8:]))
 }
 
 // validCookiePathValue reports whether value is acceptable as a cookie Path.

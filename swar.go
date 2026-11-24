@@ -50,6 +50,17 @@ func anyByteIsCTL(w uint64) bool {
 	return ((w-repeatByte(0x20))&^w|(x-lowBits)&^x)&highBits != 0
 }
 
+// anyCookieValueStop reports whether any lane of w is '"', ';' or '\', the
+// bytes a cookie value can't carry. Like anyByteIsCTL, the three lane tests
+// are written out in one expression, which keeps it within the inliner's
+// budget.
+func anyCookieValueStop(w uint64) bool {
+	q := w ^ repeatByte('"')
+	s := w ^ repeatByte(';')
+	b := w ^ repeatByte('\\')
+	return ((q-lowBits)&^q|(s-lowBits)&^s|(b-lowBits)&^b)&highBits != 0
+}
+
 // lowercaseWord returns w with every ASCII uppercase lane lowercased.
 //
 // With the high bits cleared no lane can carry into its neighbour, so adding

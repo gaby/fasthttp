@@ -2,6 +2,8 @@ package fasthttp
 
 import (
 	"bufio"
+	"bytes"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"testing"
@@ -705,6 +707,176 @@ func TestParseRequestCookiesSkipsInvalidQuotedValues(t *testing.T) {
 	testParseRequestCookies(t, `session="abc; admin=true`, "admin=true")
 	testParseRequestCookies(t, `session=abc"; admin=true`, "admin=true")
 	testParseRequestCookies(t, `session="abc\"; admin=true`, "admin=true")
+}
+
+// cookieScannerBytewise is cookieScanner as it was before it searched for
+// the separators with bytes.IndexByte: one pass over every byte, the name
+// ending at the first '=' and the cookie at the first ';'. The tests below
+// hold the scanner, and validCookieValue, to the results of this version.
+type cookieScannerBytewise struct {
+	b []byte
+}
+
+func (s *cookieScannerBytewise) scan(key, val *[]byte, arg func(dst, src []byte, skipQuotes bool) []byte) bool {
+	b := s.b
+	if len(b) == 0 {
+		return false
+	}
+
+	isKey := true
+	k := 0
+	for i, c := range b {
+		switch c {
+		case '=':
+			if isKey {
+				isKey = false
+				*key = arg(*key, b[:i], false)
+				k = i + 1
+			}
+		case ';':
+			if isKey {
+				*key = (*key)[:0]
+			}
+			*val = arg(*val, b[k:i], true)
+			j := i + 1
+			if j < len(b) && b[j] == ' ' {
+				j++
+			}
+			s.b = b[j:]
+			return true
+		}
+	}
+
+	if isKey {
+		*key = (*key)[:0]
+	}
+	*val = arg(*val, b[k:], true)
+	s.b = b[len(b):]
+	return true
+}
+
+func trimCookieArgBytewise(_, src []byte, skipQuotes bool) []byte {
+	return trimCookieArgNoCopy(src, skipQuotes)
+}
+
+func validCookieValueBytewise(value []byte) bool {
+	for _, c := range value {
+		if c == '"' || c == ';' || c == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
+func parseRequestCookiesBytewise(src []byte) []argsKV {
+	s := cookieScannerBytewise{b: src}
+	var cookies []argsKV
+	var kv *argsKV
+	cookies, kv = allocArg(cookies)
+	for s.scan(&kv.key, &kv.value, decodeCookieArg) {
+		if (len(kv.key) > 0 || len(kv.value) > 0) && validCookieValueBytewise(kv.value) {
+			cookies, kv = allocArg(cookies)
+		}
+	}
+	return releaseArg(cookies)
+}
+
+func sameCookies(a, b []argsKV) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !bytes.Equal(a[i].key, b[i].key) || !bytes.Equal(a[i].value, b[i].value) {
+			return false
+		}
+	}
+	return true
+}
+
+func TestCookieScannerMatchesBytewise(t *testing.T) {
+	t.Parallel()
+
+	var src []byte
+	var reused []argsKV
+	var walk func(n int)
+	walk = func(n int) {
+		for _, raw := range []bool{false, true} {
+			s := cookieScanner{b: src}
+			old := cookieScannerBytewise{b: src}
+			arg := decodeCookieArg
+			if raw {
+				arg = trimCookieArgBytewise
+			}
+			var k, v, wantK, wantV []byte
+			for i := 0; ; i++ {
+				var more bool
+				if raw {
+					more = s.nextRaw(&k, &v)
+				} else {
+					more = s.next(&k, &v)
+				}
+				wantMore := old.scan(&wantK, &wantV, arg)
+				if more != wantMore {
+					t.Fatalf("raw=%v, cookie %d of %q: got more=%v, want %v", raw, i, src, more, wantMore)
+				}
+				if more && (!bytes.Equal(k, wantK) || !bytes.Equal(v, wantV)) {
+					t.Fatalf("raw=%v, cookie %d of %q: got %q=%q, want %q=%q", raw, i, src, k, v, wantK, wantV)
+				}
+				if !more {
+					break
+				}
+			}
+		}
+		reused = parseRequestCookies(reused[:0], src)
+		if want := parseRequestCookiesBytewise(src); !sameCookies(reused, want) {
+			t.Fatalf("parseRequestCookies(%q) = %q, want %q",
+				src, appendRequestCookieBytes(nil, reused), appendRequestCookieBytes(nil, want))
+		}
+		if n == 0 {
+			return
+		}
+		for _, c := range []byte("a=; \t\"\\") {
+			src = append(src, c)
+			walk(n - 1)
+			src = src[:len(src)-1]
+		}
+	}
+	walk(7)
+}
+
+func TestValidCookieValueMatchesBytewise(t *testing.T) {
+	t.Parallel()
+
+	// Every byte in every position of values up to three words long, among
+	// bytes that can't match.
+	buf := make([]byte, 24)
+	for n := 0; n <= len(buf); n++ {
+		for pos := 0; pos < n; pos++ {
+			for c := range 256 {
+				for i := range buf[:n] {
+					buf[i] = 'a'
+				}
+				buf[pos] = byte(c)
+				if got, want := validCookieValue(buf[:n]), validCookieValueBytewise(buf[:n]); got != want {
+					t.Fatalf("validCookieValue(%q) = %v, want %v", buf[:n], got, want)
+				}
+			}
+		}
+	}
+
+	// Mixes of the rejected bytes, their neighbours and the lane values that
+	// borrow or carry in word arithmetic.
+	alphabet := []byte("\"#!;:<\\[]\x00\x01\x7f\x80\xffa")
+	r := rand.New(rand.NewPCG(1, 2))
+	for range 200000 {
+		v := buf[:r.IntN(len(buf)+1)]
+		for i := range v {
+			v[i] = alphabet[r.IntN(len(alphabet))]
+		}
+		if got, want := validCookieValue(v), validCookieValueBytewise(v); got != want {
+			t.Fatalf("validCookieValue(%q) = %v, want %v", v, got, want)
+		}
+	}
 }
 
 func testParseRequestCookies(t *testing.T, s, expectedS string) {

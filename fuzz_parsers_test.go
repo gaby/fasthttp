@@ -214,6 +214,10 @@ func FuzzRequestCookies(f *testing.F) {
 			return
 		}
 		first := parseRequestCookies(nil, []byte(data))
+		if want := parseRequestCookiesBytewise([]byte(data)); !sameCookies(first, want) {
+			t.Fatalf("parseRequestCookies(%q) = %q, want %q",
+				data, appendRequestCookieBytes(nil, first), appendRequestCookieBytes(nil, want))
+		}
 		reused := parseRequestCookies(nil, []byte("old=one; stale=two; third=three"))
 		reused = parseRequestCookies(reused[:0], []byte(data))
 		if !bytes.Equal(appendRequestCookieBytes(nil, first), appendRequestCookieBytes(nil, reused)) {

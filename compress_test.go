@@ -401,15 +401,28 @@ func TestCompressInlineMatchesStackless(t *testing.T) {
 			}
 		}
 	}
+	for level := CompressBrotliNoCompression; level <= CompressBrotliBestCompression; level++ {
+		for _, s := range compressTestcases {
+			src := []byte(s)
+
+			var inlineBr, workerBr byteSliceWriter
+			writeBrotliNow(&inlineBr, src, level)
+			stacklessWriteBrotli(&compressCtx{w: &workerBr, p: src, level: level})
+			if !bytes.Equal(inlineBr.b, workerBr.b) {
+				t.Fatalf("level %d: brotli inline and on a worker differ for %d bytes", level, len(src))
+			}
+		}
+	}
 }
 
 func TestCompressWithoutInlineSlot(t *testing.T) {
 	t.Parallel()
 
 	src := createFixedBody(1e4)
-	var wantGz, wantDf byteSliceWriter
+	var wantGz, wantDf, wantBr byteSliceWriter
 	writeGzipNow(&wantGz, src, CompressDefaultCompression)
 	writeDeflateNow(&wantDf, src, CompressDefaultCompression)
+	writeBrotliNow(&wantBr, src, CompressBrotliDefaultCompression)
 
 	release := takeInlineCompressSlots()
 	defer release()
@@ -421,6 +434,9 @@ func TestCompressWithoutInlineSlot(t *testing.T) {
 	}
 	if df := AppendDeflateBytesLevel(nil, src, CompressDefaultCompression); !bytes.Equal(df, wantDf.b) {
 		t.Fatal("unexpected deflate output from a stackless worker")
+	}
+	if br := AppendBrotliBytesLevel(nil, src, CompressBrotliDefaultCompression); !bytes.Equal(br, wantBr.b) {
+		t.Fatal("unexpected brotli output from a stackless worker")
 	}
 	var buf bytes.Buffer
 	if _, err := WriteGzipLevel(&buf, src, CompressDefaultCompression); err != nil || !bytes.Equal(buf.Bytes(), wantGz.b) {
@@ -465,6 +481,10 @@ func TestInlineCompressSlotsBound(t *testing.T) {
 				}
 				df := AppendDeflateBytesLevel(nil, src, CompressBestSpeed)
 				if got, err := AppendInflateBytes(nil, df); err != nil || !bytes.Equal(got, src) {
+					failures.Add(1)
+				}
+				br := AppendBrotliBytesLevel(nil, src, CompressBrotliBestSpeed)
+				if got, err := AppendUnbrotliBytes(nil, br); err != nil || !bytes.Equal(got, src) {
 					failures.Add(1)
 				}
 			}

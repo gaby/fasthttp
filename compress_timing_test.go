@@ -45,14 +45,18 @@ var compressBenchBody = func() []byte {
 	return append(b, ']')
 }()
 
-func benchmarkCompress(b *testing.B, appendCompressed func(dst, src []byte, level int) []byte) {
-	for _, lc := range []struct {
-		name  string
-		level int
-	}{
-		{"speed", CompressBestSpeed},
-		{"default", CompressDefaultCompression},
-	} {
+type compressBenchLevel struct {
+	name  string
+	level int
+}
+
+var flateBenchLevels = []compressBenchLevel{
+	{"speed", CompressBestSpeed},
+	{"default", CompressDefaultCompression},
+}
+
+func benchmarkCompress(b *testing.B, levels []compressBenchLevel, appendCompressed func(dst, src []byte, level int) []byte) {
+	for _, lc := range levels {
 		b.Run(lc.name+"/serial", func(b *testing.B) {
 			b.SetBytes(int64(len(compressBenchBody)))
 			b.ReportAllocs()
@@ -75,9 +79,16 @@ func benchmarkCompress(b *testing.B, appendCompressed func(dst, src []byte, leve
 }
 
 func BenchmarkAppendGzipBytesLevel(b *testing.B) {
-	benchmarkCompress(b, AppendGzipBytesLevel)
+	benchmarkCompress(b, flateBenchLevels, AppendGzipBytesLevel)
 }
 
 func BenchmarkAppendDeflateBytesLevel(b *testing.B) {
-	benchmarkCompress(b, AppendDeflateBytesLevel)
+	benchmarkCompress(b, flateBenchLevels, AppendDeflateBytesLevel)
+}
+
+func BenchmarkAppendBrotliBytesLevel(b *testing.B) {
+	benchmarkCompress(b, []compressBenchLevel{
+		{"speed", CompressBrotliBestSpeed},
+		{"default", CompressBrotliDefaultCompression},
+	}, AppendBrotliBytesLevel)
 }

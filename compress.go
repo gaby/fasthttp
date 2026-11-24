@@ -351,16 +351,22 @@ type compressCtx struct {
 	level int
 }
 
-// inlineCompressSlots lets gzip and deflate run on the goroutine that asks
-// for them instead of a stackless worker.
+// inlineCompressSlots lets gzip, deflate and brotli run on the goroutine
+// that asks for them instead of a stackless worker.
 //
 // Handing the work to a worker and waiting for it takes two goroutine
 // switches. On a server with idle Ps each one wakes an OS thread, and
 // together they took a third of the time AppendGzipBytesLevel spent on
-// 6 KB of JSON at CompressBestSpeed. The flate compressors fit within the
-// stack a goroutine serving a request already has, so running them inline
-// doesn't grow it, which is what the workers are there to prevent. Brotli
-// and zstd need two to four times as much stack and stay on their workers.
+// 6 KB of JSON at CompressBestSpeed.
+//
+// What the workers save is stack. A goroutine serving a Fiber app through
+// its compress middleware already has the 8 KB that gzip and deflate need;
+// brotli doubles it while it compresses, and two GCs later the stack is
+// back to 8 KB. A goroutine serving a plain handler wrapped in
+// CompressHandler starts with 4 KB and keeps the 8 KB that gzip and deflate
+// grow it to; brotli takes it up to 16 KB, and GC shrinks that back to 8 KB.
+// Zstd, which Fiber's middleware only picks for a client that doesn't
+// accept brotli, stays on its workers.
 //
 // The workers also bound how many compressors are in use at a time, each
 // holding about a megabyte of state, to their number, GOMAXPROCS. There

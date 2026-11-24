@@ -119,13 +119,18 @@ func WriteBrotliLevel(w io.Writer, p []byte, level int) (int, error) {
 	case *byteSliceWriter,
 		*bytes.Buffer,
 		*bytebufferpool.ByteBuffer:
-		// These writers don't block, so we can just use stacklessWriteBrotli
-		ctx := &compressCtx{
+		// These writers don't block, so the compression can run right
+		// here, or on a stackless worker when no inline slot is free.
+		if inlineCompressSlots.tryAcquire() {
+			defer inlineCompressSlots.release()
+			writeBrotliNow(w, p, level)
+			return len(p), nil
+		}
+		stacklessWriteBrotli(&compressCtx{
 			w:     w,
 			p:     p,
 			level: level,
-		}
-		stacklessWriteBrotli(ctx)
+		})
 		return len(p), nil
 	default:
 		zw := acquireStacklessBrotliWriter(w, level)
@@ -151,11 +156,17 @@ func stacklessWriteBrotli(ctx any) {
 
 func nonblockingWriteBrotli(ctxv any) {
 	ctx := ctxv.(*compressCtx) //nolint:forcetypeassert
-	zw := acquireRealBrotliWriter(ctx.w, ctx.level)
+	writeBrotliNow(ctx.w, ctx.p, ctx.level)
+}
 
-	zw.Write(ctx.p) //nolint:errcheck // no way to handle this error anyway
+// writeBrotliNow brotlies p to w, which must not block, on the calling
+// goroutine.
+func writeBrotliNow(w io.Writer, p []byte, level int) {
+	zw := acquireRealBrotliWriter(w, level)
 
-	releaseRealBrotliWriter(zw, ctx.level)
+	zw.Write(p) //nolint:errcheck // no way to handle this error anyway
+
+	releaseRealBrotliWriter(zw, level)
 }
 
 // WriteBrotli writes brotlied p to w and returns the number of compressed
